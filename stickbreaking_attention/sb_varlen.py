@@ -65,6 +65,7 @@ def _forward(
     logit_scale,
     batch_size,
     token_size,
+    head_size,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -80,6 +81,8 @@ def _forward(
     M_range = tl.arange(0, BLOCK_M)
     N_range = tl.arange(0, BLOCK_N)
     D_range = tl.arange(0, BLOCK_D)
+    D_mask = D_range < head_size
+
     cm = tl.where(N_range[:, None] >= N_range[None, :], 1.0, 0.0).to(Q_ptr.type.element_ty)
 
     M_blk_idxs = tl.max_contiguous(tl.multiple_of(M_block_id * BLOCK_M + M_range, BLOCK_M), BLOCK_M)
@@ -102,10 +105,10 @@ def _forward(
     # --- Load band vectors ---
     M_mask = M_blk_idxs < token_size
     if NO_M_MASK:
-        q = tl.load(Q_blk_ptrs)
+        q = tl.load(Q_blk_ptrs, mask=D_mask[None, :], other=0.)
         batch_ids = tl.load(batch_ptr + M_blk_idxs)
     else:
-        q = tl.load(Q_blk_ptrs, mask=M_mask[:, None])
+        q = tl.load(Q_blk_ptrs, mask=M_mask[:, None] & D_mask[None, :], other=0.)
         batch_ids = tl.load(batch_ptr + M_blk_idxs, mask=M_mask, other=batch_size)
     start_idxs = tl.load(CSL_ptr + batch_ids - 1, mask=batch_ids > 0, other=0).to(tl.int64)
     first_N_block_id = tl.min(start_idxs) // BLOCK_N
@@ -126,21 +129,22 @@ def _forward(
         is_last_block = i == (iters - 1)
         on_N_edge = on_band and i == 0
         neg_log, p, _, v = compute_block(
-            q,
-            neg_log_acc,
-            min_start_idxs,
-            start_idxs,
-            token_size,
-            cm,
-            qk_scale,
-            K_blk_ptrs,
-            V_blk_ptrs,
-            M_blk_idxs,
-            N_blk_idxs,
-            is_last_block,
-            is_same_start,
-            on_N_edge,
-            on_band,
+            q=q,
+            neg_log_acc=neg_log_acc,
+            min_start_idxs=min_start_idxs,
+            start_idxs=start_idxs,
+            token_size=token_size,
+            cm=cm,
+            qk_scale=qk_scale,
+            K_blk_ptrs=K_blk_ptrs,
+            V_blk_ptrs=V_blk_ptrs,
+            M_blk_idxs=M_blk_idxs,
+            N_blk_idxs=N_blk_idxs,
+            D_mask=D_mask,
+            is_last_block=is_last_block,
+            is_same_start=is_same_start,
+            on_N_edge=is_same_start,
+            on_band=on_band,
         )
         # Store intermediate values
         if not no_grad:
@@ -148,7 +152,7 @@ def _forward(
         neg_log_acc += tl.sum(neg_log, axis=1)
         acc = tl.dot(p.to(v.dtype), v, acc, allow_tf32=ALLOW_TF32)
 
-    tl.store(O_blk_ptrs, acc.to(O_ptr.type.element_ty), mask=M_mask[:, None])
+    tl.store(O_blk_ptrs, acc.to(O_ptr.type.element_ty), mask=M_mask[:, None] & D_mask[None, :])
     tl.store(R_blk_ptrs, tl.math.exp2(neg_log_acc), mask=M_mask)
 
 
@@ -165,6 +169,7 @@ def compute_block(
     V_blk_ptrs,
     M_blk_idxs,
     N_blk_idxs,
+    D_mask,
     is_last_block: tl.constexpr,
     is_same_start: tl.constexpr,
     on_N_edge: tl.constexpr,
@@ -173,11 +178,11 @@ def compute_block(
 
     if on_N_edge:
         N_mask = N_blk_idxs < token_size
-        k = tl.load(K_blk_ptrs, mask=N_mask[None, :], other=0.0)
-        v = tl.load(V_blk_ptrs, mask=N_mask[:, None], other=0.0)
+        k = tl.load(K_blk_ptrs, mask=N_mask[None, :] & D_mask[:, None], other=0.0)
+        v = tl.load(V_blk_ptrs, mask=N_mask[:, None] & D_mask[None, :], other=0.0)
     else:
-        k = tl.load(K_blk_ptrs)
-        v = tl.load(V_blk_ptrs)
+        k = tl.load(K_blk_ptrs, mask=D_mask[:, None])
+        v = tl.load(V_blk_ptrs, mask=D_mask[None, :])
 
     needs_mask = on_band or not (is_same_start and (not is_last_block))
     if needs_mask:  # On band
@@ -220,6 +225,7 @@ def sb_fwd(q, k, v, cu_seqlens, batch_ids, cu_row_blocks, logit_scale=None, no_g
             logit_scale=logit_scale,
             batch_size=batch_size,
             token_size=token_size,
+            head_size=dim_size,
             no_grad=no_grad,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
@@ -244,6 +250,7 @@ def _backward_dq(
     logit_scale,
     batch_size,
     token_size,
+    head_size,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -256,6 +263,7 @@ def _backward_dq(
     M_range = tl.arange(0, BLOCK_M)
     N_range = tl.arange(0, BLOCK_N)
     D_range = tl.arange(0, BLOCK_D)
+    D_mask = D_range < head_size
     # Start by calculating the output block
     M_blk_idxs = M_block_id * BLOCK_M + M_range
     # NO_M_MASK = (M_block_id + 1) * BLOCK_M - 1 < token_size
@@ -303,21 +311,22 @@ def _backward_dq(
         is_last_block = i == 0
         on_N_edge = on_band and i == iters - 1
         neg_log, p, k, v = compute_block(
-            q,
-            neg_log_acc,
-            min_start_idxs,
-            start_idxs,
-            token_size,
-            cm,
-            qk_scale,
-            K_blk_ptrs,
-            V_blk_ptrs,
-            M_blk_idxs,
-            N_blk_idxs,
-            is_last_block,
-            is_same_start,
-            on_N_edge,
-            on_band,
+            q=q,
+            neg_log_acc=neg_log_acc,
+            min_start_idxs=min_start_idxs,
+            start_idxs=start_idxs,
+            token_size=token_size,
+            cm=cm,
+            qk_scale=qk_scale,
+            K_blk_ptrs=K_blk_ptrs,
+            V_blk_ptrs=V_blk_ptrs,
+            M_blk_idxs=M_blk_idxs,
+            N_blk_idxs=N_blk_idxs,
+            D_mask=D_mask,
+            is_last_block=is_last_block,
+            is_same_start=is_same_start,
+            on_N_edge=is_same_start,
+            on_band=on_band,
         )
         tl.store(DM_blk_ptrs, grad_prev_acc)
         # --- End compute attn stuff ---
@@ -337,7 +346,7 @@ def _backward_dq(
         M_blk_ptrs += stride_mi
         DM_blk_ptrs += stride_mi
 
-    tl.store(DQ_blk_ptrs, (logit_scale * dq).to(DQ_ptr.type.element_ty), mask=M_mask[:, None])
+    tl.store(DQ_blk_ptrs, (logit_scale * dq).to(DQ_ptr.type.element_ty), mask=M_mask[:, None] & D_mask[None, :])
 
 
 @triton.jit
@@ -358,6 +367,7 @@ def _backward_dkdv(
     logit_scale,
     batch_size,
     token_size,
+    head_size,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -370,6 +380,7 @@ def _backward_dkdv(
     M_range = tl.arange(0, BLOCK_M)
     N_range = tl.arange(0, BLOCK_N)
     D_range = tl.arange(0, BLOCK_D)
+    D_mask = D_range < head_size
     # Start by calculating the output block
     N_blk_idxs = N_block_id * BLOCK_N + N_range
     N_mask = N_blk_idxs < token_size
@@ -394,8 +405,8 @@ def _backward_dkdv(
 
     # --- Load band vectors ---
     cm = tl.where(N_range[:, None] >= N_range[None, :], 1.0, 0.0).to(Q_ptr.type.element_ty)
-    k = tl.load(K_blk_ptrs, mask=N_mask[None, :], other=0.0)
-    vT = tl.load(V_blk_ptrs, mask=N_mask[None, :], other=0.0)
+    k = tl.load(K_blk_ptrs, mask=N_mask[None, :] & D_mask[:, None], other=0.0)
+    vT = tl.load(V_blk_ptrs, mask=N_mask[None, :] & D_mask[:, None], other=0.0)
     dk = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
     # --- End band vectors ---
@@ -405,7 +416,7 @@ def _backward_dkdv(
     is_same_end = tl.min(end_idxs) == tl.max(end_idxs)
     for i in range(iters):
         M_mask = M_blk_idxs < token_size
-        q = tl.load(Q_blk_ptrs, mask=M_mask[:, None], other=0.0)
+        q = tl.load(Q_blk_ptrs, mask=M_mask[:, None] & D_mask[None, :], other=0.0)
         dr = tl.load(DR_blk_ptrs, mask=M_mask, other=0.0)
         do = tl.load(DO_blk_ptrs, mask=M_mask[:, None])
 
@@ -446,8 +457,8 @@ def _backward_dkdv(
         Q_blk_ptrs += BLOCK_M * stride_qm
         DO_blk_ptrs += BLOCK_M * stride_dom
         DR_blk_ptrs += BLOCK_M * stride_drm
-    tl.store(DK_blk_ptrs, (dk * logit_scale).to(DK_ptr.type.element_ty), mask=N_mask[:, None])
-    tl.store(DV_blk_ptrs, dv.to(DV_ptr.type.element_ty), mask=N_mask[:, None])
+    tl.store(DK_blk_ptrs, (dk * logit_scale).to(DK_ptr.type.element_ty), mask=N_mask[:, None] & D_mask[None, :])
+    tl.store(DV_blk_ptrs, dv.to(DV_ptr.type.element_ty), mask=N_mask[:, None] & D_mask[None, :])
 
 
 def sb_bwd(do, dr, q, k, v, cu_seqlens, M, sequence_ids, cu_row_blocks, first_row_block, logit_scale=None):
@@ -483,6 +494,7 @@ def sb_bwd(do, dr, q, k, v, cu_seqlens, M, sequence_ids, cu_row_blocks, first_ro
             logit_scale=logit_scale,
             batch_size=batch_size,
             token_size=token_size,
+            head_size=dim_size,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_D=BLOCK_D,
@@ -505,6 +517,7 @@ def sb_bwd(do, dr, q, k, v, cu_seqlens, M, sequence_ids, cu_row_blocks, first_ro
             logit_scale=logit_scale,
             batch_size=batch_size,
             token_size=token_size,
+            head_size=dim_size,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_D=BLOCK_D,
