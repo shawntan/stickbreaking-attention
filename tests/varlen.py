@@ -3,6 +3,7 @@ import pytest
 import math
 from torch.nn import functional as F
 from stickbreaking_attention.sb_varlen import sb_attn_varlen
+from transformers import set_seed
 
 # for reference
 def stickbreaking(q, k, v, mask, cum_weight):
@@ -61,28 +62,41 @@ def assert_close(varname, a, b, eps):
     if torch.isnan(a).any():
         print("Reference is nan")
         return 
-    diff = (a - b).abs().max()
-    print(varname, diff.item())
-    assert diff < eps, diff
+    diff = (a - b).abs()
+    from matplotlib import pyplot as plt
+    plt.imshow(diff.float().detach().cpu().numpy()[0], interpolation='none')
+    plt.savefig('diff.png')
+
+    max_diff= diff.max()
+    if max_diff < eps:
+        print(varname, max_diff.item())
+    else:
+        print(varname, max_diff.item(), diff.median().item())
+        print((diff.sum(0).median(dim=0)[0] > eps).int())
+        err_locs = (diff.sum(0).median(dim=1)[0] > eps).int()
+        print(err_locs, err_locs.sum())
+        assert max_diff < eps, max_diff
 
 
 
 class TestClass:
 
-    @pytest.mark.parametrize('batch_size', [2, 4])
+    @pytest.mark.parametrize('batch_size', [4, 2, 1])
     @pytest.mark.parametrize('num_heads', [8, 4, 2, 1, 7])
     @pytest.mark.parametrize('head_dim', [64, 32, 16, 50])
-    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 500])
-    @pytest.mark.parametrize('dtype', [torch.bfloat16])
-    def test_varlen(self, batch_size, num_heads, head_dim, length, dtype):
-        torch.set_printoptions(linewidth=1024, edgeitems=500)
+    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 256, 500])
+    @pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize('forward_only', [False, True])
+    def test_varlen(self, batch_size, num_heads, head_dim, length, dtype, forward_only):
+        set_seed(1337)
+        torch.set_printoptions(linewidth=110, edgeitems=30)
         device = torch.device('cuda:0')
-        lengths = torch.randint(length // 2, length, (batch_size,)).to(device=device, dtype=torch.int32)
+        lengths = torch.randint(length // 2, length + 1, (batch_size,)).to(device=device, dtype=torch.int32)
+        print(lengths)
         total_length = lengths.sum()
         cu_seqlens = torch.cumsum(lengths, dim=-1)
-
-        q = 0.5 * torch.randn((num_heads, total_length, head_dim), device=device, dtype=dtype)
-        k = 0.5 * torch.randn((num_heads, total_length, head_dim), device=device, dtype=dtype)
+        q = 0.5 * torch.randn((num_heads, total_length, head_dim), device=device, dtype=dtype) - 0.5
+        k = 0.5 * torch.randn((num_heads, total_length, head_dim), device=device, dtype=dtype) + 0.5
         v = 0.5 * torch.randn((num_heads, total_length, head_dim), device=device, dtype=dtype)
         q.requires_grad_()
         k.requires_grad_()
@@ -92,10 +106,14 @@ class TestClass:
                                 inv_temp=1 / math.sqrt(q.size(-1)),
                                 zero_start=False)
         o = o + rem[..., None] * v
+        torch.cuda.synchronize()
         ref_out, ref_dq, ref_dk, ref_dv = ref_bwd(do, q, k, v, lengths)
         eps = 0.05
         assert_close("o", ref_out, o, eps)
-        dq, dk, dv = torch.autograd.grad(o, inputs=(q, k, v), grad_outputs=do)
-        assert_close("dq", ref_dq, dq, eps)
-        assert_close("dk", ref_dk, dk, eps)
-        assert_close("dv", ref_dv, dv, eps)
+        if not forward_only:
+            dq, dk, dv = torch.autograd.grad(o, inputs=(q, k, v), grad_outputs=do)
+            torch.cuda.synchronize()
+            assert_close("dq", ref_dq, dq, eps)
+            assert_close("dk", ref_dk, dk, eps)
+            assert_close("dv", ref_dv, dv, eps)
+        torch.cuda.empty_cache()
