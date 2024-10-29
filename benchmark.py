@@ -52,8 +52,7 @@ def ref_fwd(q, k, v, lengths):
 
 def ref_fwdbwd(do, q, k, v, lengths):
     o = ref_fwd(q, k, v, lengths)
-    dq, dk, dv = torch.autograd.grad(o, inputs=(q, k, v), grad_outputs=do)
-    return o, dq, dk, dv
+    return o
 
 def tri_fwdbwd(do, q, k, v, lengths):
     cu_seqlens = torch.cumsum(lengths, dim=-1)
@@ -61,19 +60,16 @@ def tri_fwdbwd(do, q, k, v, lengths):
                             inv_temp=1 / math.sqrt(q.size(-1)),
                             zero_start=False)
     o = o + rem[..., None] * v
-    dq, dk, dv = torch.autograd.grad(o, inputs=(q, k, v), grad_outputs=do)
-    return o, dq, dk, dv
+    return o
 
 def flash_fwdbwd(rope, position_ids, do, q, k, v, lengths):
     cos, sin = rope(v, position_ids)
     q = (q * cos) + (rotate_half(q) * sin)
     k = (k * cos) + (rotate_half(k) * sin)
-
     lengths = lengths.to(torch.int32)
     cu_seqlens = torch.cumsum(lengths, dim=-1)
     cu_seqlens = F.pad(cu_seqlens, (1, 0)).to(torch.int32)
     max_len = torch.max(lengths)
-
     q = q.permute(1, 0, 2)
     k = k.permute(1, 0, 2)
     v = v.permute(1, 0, 2)
@@ -86,8 +82,7 @@ def flash_fwdbwd(rope, position_ids, do, q, k, v, lengths):
         causal=True
     )
     o = o.permute(1, 0, 2)
-    dq, dk, dv = torch.autograd.grad(o, inputs=(q, k, v), grad_outputs=do)
-    return o, dq, dk, dv
+    return o
 
 
 providers = [
@@ -105,14 +100,13 @@ providers = [
         styles=[x[2] for x in providers],
         ylabel="ms",
         plot_name=f"triton v torch",
-        args={"batch_size": 2, "num_heads": 8, "head_dim": 64, "dtype": torch.bfloat16}
+        args={"batch_size": 2, "num_heads": 8, "head_dim": 64, "dtype": torch.bfloat16, "bwd": False}
     )
 ])
-def benchmark_varlen(batch_size, num_heads, head_dim, length, dtype, provider):
+def benchmark_varlen(batch_size, num_heads, head_dim, length, dtype, provider, bwd):
     device = torch.device('cuda:0')
     set_seed(1337)
     lengths = torch.randint(length // 2, length, (batch_size,)).to(device=device, dtype=torch.int32)
-    print(lengths)
     total_length = lengths.sum()
     warmup = 100
     rep = 1000
@@ -133,8 +127,13 @@ def benchmark_varlen(batch_size, num_heads, head_dim, length, dtype, provider):
     elif provider == "flash":
         rope = LlamaRotaryEmbedding(dim=head_dim).to(device)
         fun = lambda: flash_fwdbwd(rope, position_ids, do, q, k, v, lengths)
-
-    return triton.testing.do_bench(fun, warmup=warmup, rep=rep)
+    if bwd:
+        def fun_():
+            o = fun()
+            dq, dk, dv = torch.autograd.grad(o, inputs=(q, k, v), grad_outputs=do)
+        return triton.testing.do_bench(fun_, warmup=warmup, rep=rep)
+    else:
+        return triton.testing.do_bench(fun, warmup=warmup, rep=rep)
 
 
 
