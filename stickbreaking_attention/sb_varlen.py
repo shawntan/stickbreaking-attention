@@ -188,7 +188,7 @@ def compute_block(
     if needs_mask:  # On band
         mask = start_idxs[:, None] <= N_blk_idxs[None, :]  # sequence boundary
         if on_band:
-            mask &= M_blk_idxs[:, None] > N_blk_idxs[None, :]  # diagonal boundary
+            mask &= M_blk_idxs[:, None] >= N_blk_idxs[None, :]  # diagonal boundary
         neg_log, p = compute_attn_weights(q, k, cm, neg_log_acc, qk_scale, mask, MASK=True)
     else:
         neg_log, p = compute_attn_weights(q, k, cm, neg_log_acc, qk_scale, None, MASK=False)
@@ -437,7 +437,7 @@ def _backward_dkdv(
         if needs_mask:  # On band
             mask = M_blk_idxs[:, None] < end_idxs[None, :]  # sequence boundary
             if on_band:
-                mask &= M_blk_idxs[:, None] > N_blk_idxs[None, :]  # diagonal boundary
+                mask &= M_blk_idxs[:, None] >= N_blk_idxs[None, :]  # diagonal boundary
             neg_log, p = compute_attn_weights(q, k, cm, neg_log_acc, qk_scale, mask, MASK=True)
         else:
             neg_log, p = compute_attn_weights(q, k, cm, neg_log_acc, qk_scale, None, MASK=False)
