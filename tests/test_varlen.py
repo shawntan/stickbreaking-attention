@@ -84,7 +84,7 @@ class TestClass:
     @pytest.mark.parametrize('batch_size', [1, 4, 2])
     @pytest.mark.parametrize('num_heads', [1, 8, 4, 2, 7])
     @pytest.mark.parametrize('head_dim', [64, 32, 16, 50])
-    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 256, 16, 500])
+    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 256, 16, 5, 500])
     @pytest.mark.parametrize('dtype', [torch.float32])
     @pytest.mark.parametrize('forward_only', [False, True])
     def test_varlen(self, batch_size, num_heads, head_dim, length, dtype, forward_only):
