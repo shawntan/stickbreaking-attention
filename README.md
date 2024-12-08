@@ -1,7 +1,7 @@
 # Stick-breaking Attention Implementation
 Triton-based implementation of Stick-breaking Attention on GPUs.
 This implementation is for variable length .
-You can find the paper [here](https://arxiv.org/abs/2403.08245)
+You can find the paper [here](https://arxiv.org/abs/2410.17980)
 
 ## Installation
 ```sh
