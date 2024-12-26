@@ -6,27 +6,34 @@ from ..utils import ALLOW_TF32, inv_log2
 from .softplus import softplus
 from ..utils import custom_op
 
+inv_log2: tl.constexpr = inv_log2
+ALLOW_TF32: tl.constexpr = False
 
 @triton.jit
-def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr):
+def load_kv(K_blk_ptrs, V_blk_ptrs, LF_blk_ptrs,
+            N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr):
     if NO_D_MASK:
         if NO_N_MASK:
             k = tl.load(K_blk_ptrs)
             v = tl.load(V_blk_ptrs)
+            lf = tl.load(LF_blk_ptrs)
         else:
             k = tl.load(K_blk_ptrs, mask=N_mask[:, None])
             v = tl.load(V_blk_ptrs, mask=N_mask[:, None])
+            lf = tl.load(LF_blk_ptrs, mask=N_mask)
     else:
         mask = N_mask[:, None] & D_mask[None, :]
         k = tl.load(K_blk_ptrs, mask=mask)
         v = tl.load(V_blk_ptrs, mask=mask)
-    return k, v
+        lf = tl.load(LF_blk_ptrs, mask=N_mask)
+    return k, v, lf
 
 
 @triton.jit
 def compute_block(
     q,
     k,
+    lf,
     qk_scale,
     neg_log_acc,
     M_blk_idxs,
@@ -40,41 +47,43 @@ def compute_block(
     is_compiling: tl.constexpr = False,
 ):
     qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * qk_scale
+    log_beta = -softplus(-qk, is_compiling=is_compiling) + inv_log2 * lf[None, :]
+    log_om_beta = tl.math.log2(1 - tl.math.exp2(log_beta))
 
-    # log_om_beta (one minus beta) : log(1 - \beta)
-    log_om_beta = -softplus(qk, is_compiling=is_compiling)
+    # if tl.program_id(2) == 0:
+    #    tl.device_print("neg_log_acc", neg_log_acc)
 
-    if on_band:  # diagonal
+    if on_band: # diagonal
         if attend_current:
             block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
         else:
             block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
+
         log_om_beta = tl.where(block_mask, log_om_beta, 0.0)
         if backward:
             neg_log_acc -= tl.sum(log_om_beta, axis=1)
-        log_p = qk + neg_log_acc[:, None]
-
+        log_p = log_beta + neg_log_acc[:, None]
         if use_cumsum:
             log_p += tl.cumsum(log_om_beta.to(q.dtype), axis=1, reverse=True)
         else:
-            log_p = tl.dot(log_om_beta.to(q.dtype), cm,
-                           acc=log_p, allow_tf32=ALLOW_TF32)
-
+            log_p = tl.dot(log_om_beta.to(q.dtype), cm, acc=log_p, allow_tf32=ALLOW_TF32)
+        log_p -= log_om_beta.to(q.dtype)
         p = tl.math.exp2(log_p)
         p = tl.where(block_mask, p, 0.0)
     else:
         if backward:
             neg_log_acc -= tl.sum(log_om_beta, axis=1)
-        log_p = qk + neg_log_acc[:, None]
+        log_p = log_beta + neg_log_acc[:, None]
         if use_cumsum:
             log_p += tl.cumsum(log_om_beta.to(q.dtype), axis=1, reverse=True)
         else:
-            log_p = tl.dot(log_om_beta.to(q.dtype), cm,
-                           acc=log_p, allow_tf32=ALLOW_TF32)
-
+            log_p = tl.dot(log_om_beta.to(q.dtype), cm,acc=log_p, allow_tf32=ALLOW_TF32)
+        log_p -= log_om_beta.to(q.dtype)
         p = tl.math.exp2(log_p)
+
     if not backward:
         neg_log_acc += tl.sum(log_om_beta, axis=1)
+
     return p, log_om_beta, neg_log_acc
 
 
@@ -97,6 +106,7 @@ def _forward_one_row(
     V_head_seq_ptr,
     stride_vn,
     stride_vd: tl.constexpr,
+    LF_head_seq_ptr, stride_lfn: tl.constexpr,
     O_head_seq_ptr,
     stride_om,
     stride_od: tl.constexpr,
@@ -132,14 +142,12 @@ def _forward_one_row(
     N_blk_idxs = N_blk_idxs_start + N_range
 
     # Init pointers
-    Q_blk_ptrs = Q_head_seq_ptr + \
-        (stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :])
-    K_blk_ptrs = K_head_seq_ptr + \
-        (stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :])
-    V_blk_ptrs = V_head_seq_ptr + \
-        (stride_vn * N_blk_idxs[:, None] + stride_vd * D_range[None, :])
-    O_blk_ptrs = O_head_seq_ptr + \
-        (stride_om * M_blk_idxs[:, None] + stride_od * D_range[None, :])
+    Q_blk_ptrs = Q_head_seq_ptr + (stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :])
+    K_blk_ptrs = K_head_seq_ptr + (stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :])
+    V_blk_ptrs = V_head_seq_ptr + (stride_vn * N_blk_idxs[:, None] + stride_vd * D_range[None, :])
+    LF_blk_ptrs = LF_head_seq_ptr + stride_lfn * N_blk_idxs
+
+    O_blk_ptrs = O_head_seq_ptr + (stride_om * M_blk_idxs[:, None] + stride_od * D_range[None, :])
     R_blk_ptrs = R_head_seq_ptr + stride_rm * M_blk_idxs
     A_blk_ptrs = A_head_seq_ptr + stride_am * M_blk_idxs
 
@@ -164,20 +172,25 @@ def _forward_one_row(
         N_blk_idxs_start -= BLOCK_N
         K_blk_ptrs -= BLOCK_N * stride_kn
         V_blk_ptrs -= BLOCK_N * stride_vn
+        LF_blk_ptrs -= BLOCK_N * stride_lfn
 
         N_mask = N_blk_idxs < seq_length
-        k, v = load_kv(
+        on_band = i < BLOCK_M // BLOCK_N
+
+        k, v, lf = load_kv(
             K_blk_ptrs,
             V_blk_ptrs,
+            LF_blk_ptrs,
             N_mask=N_mask,
             NO_N_MASK=N_blk_idxs_start + BLOCK_N - 1 < seq_length,
             D_mask=D_mask,
             NO_D_MASK=NO_D_MASK,
         )
-        on_band = i < BLOCK_M // BLOCK_N
+
         p, _, neg_log_acc = compute_block(
             q,
             k,
+            lf,
             qk_scale,
             neg_log_acc,
             M_blk_idxs,
@@ -217,14 +230,14 @@ def _forward_one_row(
 
 def get_configs():
     return [triton.Config({"BLOCK_M": mb, "BLOCK_N": nb}, num_stages=s, num_warps=w)
-            for mb in [64, 128]
-            for nb in [16, 32, 64]
-            for s in [4, 2, 3, 5, 6, 7, 8]
-            for w in [4, 2]]
+            for mb in [64] # [64, 128]
+            for nb in [32] # [16, 32, 64]
+            for s in [4] # [4, 2, 3, 5, 6, 7, 8]
+            for w in [4]] # [4, 2]]
 
 
 @triton.autotune(configs=get_configs(), key=["head_size"])
-@triton.jit
+@triton.jit(debug=True)
 def _forward(
     Q_ptr,
     stride_qh: tl.constexpr,
@@ -238,6 +251,9 @@ def _forward(
     stride_vh: tl.constexpr,
     stride_vn,
     stride_vd: tl.constexpr,
+    LF_ptr,
+    stride_lfh,
+    stride_lfn: tl.constexpr,
     O_ptr,
     stride_oh: tl.constexpr,
     stride_om,
@@ -277,6 +293,7 @@ def _forward(
     fhead_id = tl.program_id(1)
     seq_alloc_prog_id = tl.program_id(2)
     num_seq_alloc_progs = tl.num_programs(2)
+
     if seq_id == 0:
         seq_start_offset = 0
     else:
@@ -296,21 +313,20 @@ def _forward(
         D_range = tl.arange(0, BLOCK_D)
         D_mask = D_range < head_size
         if not use_cumsum:
-            cm = tl.where(N_range[:, None] >= N_range[None, :], 1.0, 0.0).to(
-                Q_ptr.type.element_ty)
+            cm = tl.where(N_range[:, None] >= N_range[None, :], 1.0, 0.0).to(Q_ptr.type.element_ty)
         else:
             cm = None
-
         if seq_a_block_id >= 0:
             # First head block
             head_id = fhead_id * 2
             Q_head_seq_ptr = Q_ptr + stride_qh * head_id + stride_qm * seq_start_offset
             K_head_seq_ptr = K_ptr + stride_kh * head_id + stride_kn * seq_start_offset
             V_head_seq_ptr = V_ptr + stride_vh * head_id + stride_vn * seq_start_offset
+            LF_head_seq_ptr = LF_ptr + stride_lfh * head_id + stride_lfn * seq_start_offset
             O_head_seq_ptr = O_ptr + stride_oh * head_id + stride_om * seq_start_offset
             R_head_seq_ptr = R_ptr + stride_rh * head_id + stride_rm * seq_start_offset
             A_head_seq_ptr = A_ptr + stride_ah * head_id + stride_am * seq_start_offset
-            W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_am * seq_start_offset
+            W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_wm * seq_start_offset
             _forward_one_row(
                 seq_a_block_id,
                 seq_length,
@@ -329,6 +345,7 @@ def _forward(
                 V_head_seq_ptr,
                 stride_vn,
                 stride_vd,
+                LF_head_seq_ptr, stride_lfn,
                 O_head_seq_ptr,
                 stride_om,
                 stride_od,
@@ -358,10 +375,11 @@ def _forward(
             Q_head_seq_ptr = Q_ptr + stride_qh * head_id + stride_qm * seq_start_offset
             K_head_seq_ptr = K_ptr + stride_kh * head_id + stride_kn * seq_start_offset
             V_head_seq_ptr = V_ptr + stride_vh * head_id + stride_vn * seq_start_offset
+            LF_head_seq_ptr = LF_ptr + stride_lfh * head_id + stride_lfn * seq_start_offset
             O_head_seq_ptr = O_ptr + stride_oh * head_id + stride_om * seq_start_offset
             R_head_seq_ptr = R_ptr + stride_rh * head_id + stride_rm * seq_start_offset
             A_head_seq_ptr = A_ptr + stride_ah * head_id + stride_am * seq_start_offset
-            W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_am * seq_start_offset
+            W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_wm * seq_start_offset
             _forward_one_row(
                 seq_b_block_id,
                 seq_length,
@@ -380,6 +398,7 @@ def _forward(
                 V_head_seq_ptr,
                 stride_vn,
                 stride_vd,
+                LF_head_seq_ptr, stride_lfn,
                 O_head_seq_ptr,
                 stride_om,
                 stride_od,
@@ -406,8 +425,9 @@ def _forward(
 
 
 def varlen_fwd(
-    q, k, v, cu_seqlens, max_seqlens, logit_scale, attend_current=False, no_grad=False, return_attention=False, BLOCK_M=64, BLOCK_N=32
-):
+    q, k, v, log_forget,
+    cu_seqlens, max_seqlens, logit_scale,
+    attend_current=False, no_grad=False, return_attention=False, BLOCK_M=64, BLOCK_N=32):
     batch_size = cu_seqlens.size(0)
     num_heads, token_size, dim_size = q.size()
     o = torch.empty_like(q)
@@ -423,6 +443,7 @@ def varlen_fwd(
         q,
         k,
         v,
+        log_forget,
         cu_seqlens,
         max_seqlens,
         logit_scale,
@@ -441,6 +462,9 @@ def varlen_fwd(
         attend_current=attend_current
     )
     if return_attention:
+        from matplotlib import pyplot as plt
+        plt.imshow(W[0].cpu(), interpolation='none')
+        plt.savefig('attn.png')
         return o, rem, neg_log_acc, W
     else:
         return o, rem, neg_log_acc
@@ -451,6 +475,7 @@ def _compileable_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    log_forget: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlens: int,
     logit_scale: float,
@@ -468,20 +493,22 @@ def _compileable_forward(
     W: torch.Tensor,
     attend_current: bool,
 ) -> None:
-    num_sequences = batch_size
-    num_folded_heads = triton.cdiv(num_heads, 2)
-    num_seq_blocks = triton.cdiv(max_seqlens, BLOCK_M) + 1
+    # num_sequences = batch_size
     BLOCK_D = triton.next_power_of_2(dim_size)
-    grid = (num_sequences, num_folded_heads, num_seq_blocks)
+    def grid(meta):
+        return (batch_size,
+                triton.cdiv(num_heads, 2),
+                triton.cdiv(max_seqlens, meta['BLOCK_M']) + 1)
     q_stride = q.stride()
     k_stride = k.stride()
     v_stride = v.stride()
     o_stride = o.stride()
-
+    lf_stride = log_forget.stride()
     _forward[grid](
         q, q_stride[0], q_stride[1], q_stride[2],
         k, k_stride[0], k_stride[1], k_stride[2],
         v, v_stride[0], v_stride[1], v_stride[2],
+        log_forget, log_forget.stride(0), log_forget.stride(1),
         o, o_stride[0], o_stride[1], o_stride[2],
         rem,
         rem.stride(0),

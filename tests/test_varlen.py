@@ -101,6 +101,7 @@ class TestClass:
         assert_close("o", ref_out, o, eps)
         if not forward_only:
             dq, dk, dv = torch.autograd.grad(o, inputs=(q, k, v), grad_outputs=do)
+            torch.cuda.synchronize()
             assert_close("dq", ref_dq, dq, eps)
             assert_close("dk", ref_dk, dk, eps)
             assert_close("dv", ref_dv, dv, eps)

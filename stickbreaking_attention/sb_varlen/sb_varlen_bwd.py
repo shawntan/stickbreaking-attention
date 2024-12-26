@@ -53,9 +53,7 @@ def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_m
 
 
 def get_configs():
-    return [triton.Config({"BLOCK_M": mb, "BLOCK_N": nb}, num_stages=s, num_warps=w)
-            for mb in [64, 128]
-            for nb in [16, 32, 64]
+    return [triton.Config({}, num_stages=s, num_warps=w)
             for s in [8, 7, 6, 5, 4, 3, 2]
             for w in [4, 2]]
 
@@ -479,44 +477,43 @@ def varlen_bwd(
     # dqdkdv = torch.zeros((token_size, num_heads, 3 * dim_size), device=do.device, dtype=do.dtype)
     # dqdkdv = dqdkdv.permute(1, 0, 2)
     # dq, dk, dv = dqdkdv.chunk(3, dim=-1)
-    with torch.inference_mode():
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
 
-        num_sequences = batch_size
-        num_folded_heads = triton.cdiv(num_heads, 2)
-        num_seq_blocks = triton.cdiv(max_seqlens, BLOCK_M) + 1
-        N_count = num_seq_blocks * (BLOCK_M // BLOCK_N)
-        dkdv_lock = torch.zeros(
-            (num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
-        dkdv_count = torch.zeros(
-            (num_sequences, num_heads, N_count), dtype=torch.bool, device=q.device)
-        _compileable_backward(
-            do,
-            dr,
-            q,
-            k,
-            v,
-            cu_seqlens,
-            neg_log_acc,
-            logit_scale,
-            BLOCK_M,
-            BLOCK_N,
-            batch_size,
-            num_heads,
-            token_size,
-            dim_size,
-            dq,
-            dk,
-            dv,
-            dkdv_lock,
-            dkdv_count,
-            num_sequences,
-            num_folded_heads,
-            num_seq_blocks,
-            attend_current=attend_current
-        )
+    num_sequences = batch_size
+    num_folded_heads = triton.cdiv(num_heads, 2)
+    num_seq_blocks = triton.cdiv(max_seqlens, BLOCK_M) + 1
+    N_count = num_seq_blocks * (BLOCK_M // BLOCK_N)
+    dkdv_lock = torch.zeros(
+        (num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
+    dkdv_count = torch.zeros(
+        (num_sequences, num_heads, N_count), dtype=torch.bool, device=q.device)
+    _compileable_backward(
+        do,
+        dr,
+        q,
+        k,
+        v,
+        cu_seqlens,
+        neg_log_acc,
+        logit_scale,
+        BLOCK_M,
+        BLOCK_N,
+        batch_size,
+        num_heads,
+        token_size,
+        dim_size,
+        dq,
+        dk,
+        dv,
+        dkdv_lock,
+        dkdv_count,
+        num_sequences,
+        num_folded_heads,
+        num_seq_blocks,
+        attend_current=attend_current
+    )
     return dq, dk, dv
 
 
@@ -547,69 +544,70 @@ def _compileable_backward(
     attend_current: bool = False,
 ) -> None:
     BLOCK_D = triton.next_power_of_2(dim_size)
-    _backward[num_sequences, num_folded_heads, num_seq_blocks](
-        # DO_ptr, stride_doh, stride_dom, stride_dod,
-        do,
-        do.stride(0),
-        do.stride(1),
-        do.stride(2),
-        # DR_ptr, stride_drh, stride_drm,
-        dr,
-        dr.stride(0),
-        dr.stride(1),
-        # A_ptr, stride_ah, stride_am,
-        neg_log_acc,
-        neg_log_acc.stride(0),
-        neg_log_acc.stride(1),
-        # Q_ptr, stride_qh, stride_qm, stride_qd,
-        q,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        # K_ptr, stride_kh, stride_kn, stride_kd,
-        k,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        # V_ptr, stride_vh, stride_vn, stride_vd,
-        v,
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        # DQ_ptr, stride_dqh, stride_dqm, stride_dqd,
-        dq,
-        dq.stride(0),
-        dq.stride(1),
-        dq.stride(2),
-        # DK_ptr, stride_dkh, stride_dkn, stride_dkd,
-        dk,
-        dk.stride(0),
-        dk.stride(1),
-        dk.stride(2),
-        # DV_ptr, stride_dvh, stride_dvn, stride_dvd,
-        dv,
-        dv.stride(0),
-        dv.stride(1),
-        dv.stride(2),
-        # KV_Lock_ptr, KV_Count_ptr, stride_kvl,
-        dkdv_lock,
-        dkdv_count,
-        dkdv_lock.stride(0),
-        dkdv_lock.stride(1),
-        cu_seqlens,
-        logit_scale=logit_scale,
-        batch_size=batch_size,
-        token_size=token_size,
-        head_size=dim_size,
-        num_heads=num_heads,
-        # BLOCK_M=BLOCK_M,
-        # BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D,
-        BLOCK_CSL=triton.next_power_of_2(batch_size),
-        NO_D_MASK=BLOCK_D == dim_size,
-        NO_M_MASK=False,
-        NO_N_MASK=False,
-        ALLOW_TF32=ALLOW_TF32,
-        inv_log2=inv_log2,
-        attend_current=attend_current
-    )
+    with torch.cuda.device(q.device):
+        _backward[num_sequences, num_folded_heads, num_seq_blocks](
+            # DO_ptr, stride_doh, stride_dom, stride_dod,
+            do,
+            do.stride(0),
+            do.stride(1),
+            do.stride(2),
+            # DR_ptr, stride_drh, stride_drm,
+            dr,
+            dr.stride(0),
+            dr.stride(1),
+            # A_ptr, stride_ah, stride_am,
+            neg_log_acc,
+            neg_log_acc.stride(0),
+            neg_log_acc.stride(1),
+            # Q_ptr, stride_qh, stride_qm, stride_qd,
+            q,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            # K_ptr, stride_kh, stride_kn, stride_kd,
+            k,
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            # V_ptr, stride_vh, stride_vn, stride_vd,
+            v,
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            # DQ_ptr, stride_dqh, stride_dqm, stride_dqd,
+            dq,
+            dq.stride(0),
+            dq.stride(1),
+            dq.stride(2),
+            # DK_ptr, stride_dkh, stride_dkn, stride_dkd,
+            dk,
+            dk.stride(0),
+            dk.stride(1),
+            dk.stride(2),
+            # DV_ptr, stride_dvh, stride_dvn, stride_dvd,
+            dv,
+            dv.stride(0),
+            dv.stride(1),
+            dv.stride(2),
+            # KV_Lock_ptr, KV_Count_ptr, stride_kvl,
+            dkdv_lock,
+            dkdv_count,
+            dkdv_lock.stride(0),
+            dkdv_lock.stride(1),
+            cu_seqlens,
+            logit_scale=logit_scale,
+            batch_size=batch_size,
+            token_size=token_size,
+            head_size=dim_size,
+            num_heads=num_heads,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_D=BLOCK_D,
+            BLOCK_CSL=triton.next_power_of_2(batch_size),
+            NO_D_MASK=BLOCK_D == dim_size,
+            NO_M_MASK=False,
+            NO_N_MASK=False,
+            ALLOW_TF32=ALLOW_TF32,
+            inv_log2=inv_log2,
+            attend_current=attend_current
+        )

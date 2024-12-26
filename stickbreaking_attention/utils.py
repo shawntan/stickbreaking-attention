@@ -1,11 +1,12 @@
 import torch
 from typing import Callable, Iterable, Sequence
 import math
+import triton.language as tl
 
 PACKAGE_NAME = "stickbreaking_attention"
 log2 = math.log(2)
-inv_log2 = 1 / log2
-ALLOW_TF32 = True
+inv_log2: tl.constexpr = 1 / log2
+ALLOW_TF32: tl.constexpr = True
 
 
 
