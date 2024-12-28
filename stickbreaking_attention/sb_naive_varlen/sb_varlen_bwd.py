@@ -6,11 +6,55 @@ import triton.language as tl
 
 from ..utils import ALLOW_TF32, inv_log2
 from .sb_varlen_fwd import compute_block, load_kv
-from ..sb_varlen.sb_varlen_bwd import locked_add
 
 from ..utils import custom_op
 
 ALLOW_TF32: tl.constexpr = False
+
+
+@triton.jit
+# TODO add two-step lock?
+def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr):
+    while tl.atomic_cas(Lock_ptr, 0, 1) == 1:
+        pass
+    count = tl.load(Count_ptr, eviction_policy="evict_last")
+    if NO_D_MASK:
+        if NO_N_MASK:
+            if count == 0:
+                tl.store(Count_ptr, True, eviction_policy="evict_last")
+            else:
+                a += tl.load(A_ptrs, eviction_policy="evict_last")
+                b += tl.load(B_ptrs, eviction_policy="evict_last")
+            tl.store(A_ptrs, a, eviction_policy="evict_last")
+            tl.store(B_ptrs, b, eviction_policy="evict_last")
+
+        else:
+            if count == 0:
+                tl.store(Count_ptr, True, eviction_policy="evict_last")
+            else:
+                a += tl.load(A_ptrs,
+                             mask=N_mask[:, None], eviction_policy="evict_last")
+                b += tl.load(B_ptrs,
+                             mask=N_mask[:, None], eviction_policy="evict_last")
+            tl.store(A_ptrs, a, mask=N_mask[:, None],
+                     eviction_policy="evict_last")
+            tl.store(B_ptrs, b, mask=N_mask[:, None],
+                     eviction_policy="evict_last")
+
+    else:
+        mask = N_mask[:, None] & D_mask[None, :]
+        if count == 0:
+            tl.store(Count_ptr, True, eviction_policy="evict_last")
+        else:
+            a += tl.load(A_ptrs, mask=mask, eviction_policy="evict_last")
+            b += tl.load(B_ptrs, mask=mask, eviction_policy="evict_last")
+        tl.store(A_ptrs, a, mask=mask, eviction_policy="evict_last")
+        tl.store(B_ptrs, b, mask=mask, eviction_policy="evict_last")
+
+    tl.atomic_xchg(Lock_ptr, 0)
+
+
+
 
 def get_configs():
     return [triton.Config({}, num_stages=s, num_warps=w)
