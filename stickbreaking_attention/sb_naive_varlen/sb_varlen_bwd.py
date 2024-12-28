@@ -377,25 +377,21 @@ def _backward_one_row(
         )
 
         locked_add(
-            KV_Lock_head_seq_ptr + i,
-            KV_Count_head_seq_ptr + i,
-            DK_blk_ptrs,
-            block_dk,
-            DV_blk_ptrs,
-            block_dv,
-            N_mask,
-            NO_N_MASK,
-            D_mask,
-            NO_D_MASK,
+            KV_Lock_head_seq_ptr + i, KV_Count_head_seq_ptr + i,
+            DK_blk_ptrs, block_dk,
+            DV_blk_ptrs, block_dv,
+            N_mask, NO_N_MASK,
+            D_mask, NO_D_MASK,
         )
         # --- End gradient stuff ---
         N_blk_idxs += BLOCK_N
         N_blk_idxs_start += BLOCK_N
         K_blk_ptrs += BLOCK_N * stride_kn
         V_blk_ptrs += BLOCK_N * stride_vn
-        LF_blk_ptrs += BLOCK_N * stride_lfn
         DK_blk_ptrs += BLOCK_N * stride_dkn
         DV_blk_ptrs += BLOCK_N * stride_dvn
+        LF_blk_ptrs += BLOCK_N * stride_lfn
+        DLF_blk_ptrs += BLOCK_N * stride_dlfn
 
     dq = (logit_scale * dq).to(DQ_head_seq_ptr.type.element_ty)
 
