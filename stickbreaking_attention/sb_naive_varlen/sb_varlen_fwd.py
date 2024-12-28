@@ -47,19 +47,18 @@ def compute_block(
     is_compiling: tl.constexpr = False,
 ):
     qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * qk_scale
-    log_beta = -softplus(-qk, is_compiling=is_compiling) + inv_log2 * lf[None, :]
+    log_beta1 = -softplus(-qk, is_compiling=is_compiling) 
+    log_beta2 = inv_log2 * lf[None, :]
+
+    log_beta = log_beta1 + log_beta2
     log_om_beta = tl.math.log2(1 - tl.math.exp2(log_beta))
-
-    # if tl.program_id(2) == 0:
-    #    tl.device_print("neg_log_acc", neg_log_acc)
-
     if on_band: # diagonal
         if attend_current:
             block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
         else:
             block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
-
         log_om_beta = tl.where(block_mask, log_om_beta, 0.0)
+        log_beta1 = tl.where(block_mask, log_beta1, 0.0)
         if backward:
             neg_log_acc -= tl.sum(log_om_beta, axis=1)
         log_p = log_beta + neg_log_acc[:, None]
@@ -84,7 +83,7 @@ def compute_block(
     if not backward:
         neg_log_acc += tl.sum(log_om_beta, axis=1)
 
-    return p, log_om_beta, neg_log_acc
+    return p, log_beta1, log_beta2, log_beta, log_om_beta, neg_log_acc
 
 
 @triton.jit
@@ -187,7 +186,7 @@ def _forward_one_row(
             NO_D_MASK=NO_D_MASK,
         )
 
-        p, _, neg_log_acc = compute_block(
+        p, log_beta1, log_beta2, log_beta, log_om_beta, neg_log_acc = compute_block(
             q,
             k,
             lf,

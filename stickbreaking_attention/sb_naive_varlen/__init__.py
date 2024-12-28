@@ -58,15 +58,13 @@ class StickBreakingAttention(torch.autograd.Function):
         return dq, dk, dv, dlf, None, None, None, None
 
 
-def sb_attn_varlen(q, k, v, fl, cu_seqlens, max_seqlens, inv_temp=None, zero_start=True, attend_current=False):
+def sb_attn_varlen(q, k, v, log_forget,
+                   cu_seqlens, max_seqlens, inv_temp=None, zero_start=True, attend_current=False):
     if zero_start:
         assert cu_seqlens[0] == 0
         cu_seqlens = cu_seqlens[1:]
     if inv_temp is None:
         inv_temp = 1 / math.sqrt(q.size(-1))
-    log_forget = F.logsigmoid(fl)
-    # log_forget = log_forget * 0 +  torch.arange(log_forget.size(1), dtype=log_forget.dtype, device=log_forget.device)
-    # print(log_forget)
     return sb_attn_varlen_(q, k, v, log_forget,
                            inv_temp, cu_seqlens, max_seqlens, attend_current)
 

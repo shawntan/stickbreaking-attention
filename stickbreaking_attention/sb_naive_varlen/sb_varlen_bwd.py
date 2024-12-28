@@ -25,50 +25,18 @@ def get_configs():
 )
 @triton.jit
 def _backward(
-    DO_ptr,
-    stride_doh: tl.constexpr,
-    stride_dom,
-    stride_dod: tl.constexpr,
-    DR_ptr,
-    stride_drh,
-    stride_drm,
-    A_ptr,
-    stride_ah,
-    stride_am,
-    Q_ptr,
-    stride_qh: tl.constexpr,
-    stride_qm,
-    stride_qd: tl.constexpr,
-    K_ptr,
-    stride_kh: tl.constexpr,
-    stride_kn,
-    stride_kd: tl.constexpr,
-    V_ptr,
-    stride_vh: tl.constexpr,
-    stride_vn,
-    stride_vd: tl.constexpr,
-    LF_ptr,
-    stride_lfh,
-    stride_lfn: tl.constexpr,
-    DQ_ptr,
-    stride_dqh: tl.constexpr,
-    stride_dqm,
-    stride_dqd: tl.constexpr,
-    DK_ptr,
-    stride_dkh: tl.constexpr,
-    stride_dkn,
-    stride_dkd: tl.constexpr,
-    DV_ptr,
-    stride_dvh: tl.constexpr,
-    stride_dvn,
-    stride_dvd: tl.constexpr,
-    DLF_ptr,
-    stride_dlfh,
-    stride_dlfn: tl.constexpr,
-    KV_Lock_ptr,
-    KV_Count_ptr,
-    stride_kvs,
-    stride_kvh,
+    DO_ptr, stride_doh: tl.constexpr, stride_dom, stride_dod: tl.constexpr,
+    DR_ptr, stride_drh, stride_drm,
+    A_ptr, stride_ah, stride_am,
+    Q_ptr, stride_qh: tl.constexpr, stride_qm, stride_qd: tl.constexpr,
+    K_ptr, stride_kh: tl.constexpr, stride_kn, stride_kd: tl.constexpr,
+    V_ptr, stride_vh: tl.constexpr, stride_vn, stride_vd: tl.constexpr,
+    LF_ptr, stride_lfh, stride_lfn: tl.constexpr,
+    DQ_ptr, stride_dqh: tl.constexpr, stride_dqm, stride_dqd: tl.constexpr,
+    DK_ptr, stride_dkh: tl.constexpr, stride_dkn, stride_dkd: tl.constexpr,
+    DV_ptr, stride_dvh: tl.constexpr, stride_dvn, stride_dvd: tl.constexpr,
+    DLF_ptr, stride_dlfh, stride_dlfn: tl.constexpr,
+    KV_Lock_ptr, KV_Count_ptr, stride_kvs, stride_kvh,
     CSL_ptr,
     W_ptr, stride_wh, stride_wm, stride_wn,
     logit_scale,
@@ -320,7 +288,7 @@ def _backward_one_row(
             NO_D_MASK=NO_D_MASK,
         )
 
-        p, log_om_beta, neg_log_acc = compute_block(
+        p, log_beta1, log_beta2, log_beta, log_om_beta, neg_log_acc = compute_block(
             q, k, lf,
             qk_scale,
             neg_log_acc,
@@ -339,18 +307,25 @@ def _backward_one_row(
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
-        att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
-        cumul_att_dA = (
-            tl.dot(att_dA.to(cm.dtype), fwd_cm, allow_tf32=ALLOW_TF32) +
+        block_dv = tl.dot(tl.trans(p), do.to(p.dtype), allow_tf32=ALLOW_TF32) # correct
+
+        att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32))#  - dr[:, None])
+        att_dA = att_dA.to(cm.dtype)
+        dlog_om_beta = (
+            tl.dot(att_dA, fwd_cm, allow_tf32=ALLOW_TF32) - att_dA +
             grad_prev_acc[:, None]
         )
         grad_prev_acc += tl.sum(att_dA, axis=1)
-        beta = 1 - tl.exp2(log_om_beta)
-        dqk = att_dA - beta * cumul_att_dA
-
+        # dlog_om_beta = torch.einsum('bhij,kj->bhik', dlog_att, cm)     # correct
+        # dlog_beta2 = -dlog_om_beta * torch.exp(log_beta - log_om_beta) # correct
+        # dlog_beta = dlog_att + dlog_beta2                              # correct
+        # dlogits = dlog_beta * (1 - torch.exp(log_beta_1))              # correct
+        dlog_beta2 = - dlog_om_beta * tl.exp2(log_beta - log_om_beta)
+        dlog_beta1 = att_dA
+        dlog_beta = dlog_beta1 + dlog_beta2
+        dqk = dlog_beta * (1 - tl.exp2(log_beta1))
         dq = tl.dot(dqk.to(k.dtype), k, acc=dq, allow_tf32=ALLOW_TF32)
         block_dk = tl.dot(tl.trans(dqk).to(q.dtype), q, allow_tf32=ALLOW_TF32) * logit_scale
-        block_dv = tl.dot(tl.trans(p), do.to(p.dtype), allow_tf32=ALLOW_TF32)
 
         tl.store(
             W_head_seq_ptr + stride_wm * M_blk_idxs[:, None] + stride_wn * N_blk_idxs[None, :], p,
