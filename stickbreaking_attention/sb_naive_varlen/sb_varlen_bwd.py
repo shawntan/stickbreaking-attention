@@ -9,12 +9,17 @@ from .sb_varlen_fwd import compute_block, load_kv
 
 from ..utils import custom_op
 
-ALLOW_TF32: tl.constexpr = False
 
 
 @triton.jit
 # TODO add two-step lock?
-def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr):
+def locked_add(
+    Lock_ptr, Count_ptr,
+    A_ptrs, a,
+    B_ptrs, b,
+    C_ptrs, c,
+    N_mask, NO_N_MASK,
+    D_mask, NO_D_MASK: tl.constexpr):
     while tl.atomic_cas(Lock_ptr, 0, 1) == 1:
         pass
     count = tl.load(Count_ptr, eviction_policy="evict_last")
@@ -25,22 +30,20 @@ def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_m
             else:
                 a += tl.load(A_ptrs, eviction_policy="evict_last")
                 b += tl.load(B_ptrs, eviction_policy="evict_last")
+                c += tl.load(C_ptrs, eviction_policy="evict_last")
             tl.store(A_ptrs, a, eviction_policy="evict_last")
             tl.store(B_ptrs, b, eviction_policy="evict_last")
-
+            tl.store(C_ptrs, c, eviction_policy="evict_last")
         else:
             if count == 0:
                 tl.store(Count_ptr, True, eviction_policy="evict_last")
             else:
-                a += tl.load(A_ptrs,
-                             mask=N_mask[:, None], eviction_policy="evict_last")
-                b += tl.load(B_ptrs,
-                             mask=N_mask[:, None], eviction_policy="evict_last")
-            tl.store(A_ptrs, a, mask=N_mask[:, None],
-                     eviction_policy="evict_last")
-            tl.store(B_ptrs, b, mask=N_mask[:, None],
-                     eviction_policy="evict_last")
-
+                a += tl.load(A_ptrs, mask=N_mask[:, None], eviction_policy="evict_last")
+                b += tl.load(B_ptrs, mask=N_mask[:, None], eviction_policy="evict_last")
+                c += tl.load(C_ptrs, mask=N_mask, eviction_policy="evict_last")
+            tl.store(A_ptrs, a, mask=N_mask[:, None], eviction_policy="evict_last")
+            tl.store(B_ptrs, b, mask=N_mask[:, None], eviction_policy="evict_last")
+            tl.store(C_ptrs, c, mask=N_mask, eviction_policy="evict_last")
     else:
         mask = N_mask[:, None] & D_mask[None, :]
         if count == 0:
@@ -48,12 +51,11 @@ def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_m
         else:
             a += tl.load(A_ptrs, mask=mask, eviction_policy="evict_last")
             b += tl.load(B_ptrs, mask=mask, eviction_policy="evict_last")
+            c += tl.load(C_ptrs, mask=N_mask, eviction_policy="evict_last")
         tl.store(A_ptrs, a, mask=mask, eviction_policy="evict_last")
         tl.store(B_ptrs, b, mask=mask, eviction_policy="evict_last")
-
+        tl.store(C_ptrs, c, mask=N_mask, eviction_policy="evict_last")
     tl.atomic_xchg(Lock_ptr, 0)
-
-
 
 
 def get_configs():
@@ -82,7 +84,7 @@ def _backward(
     DLF_ptr, stride_dlfh, stride_dlfn: tl.constexpr,
     KV_Lock_ptr, KV_Count_ptr, stride_kvs, stride_kvh,
     CSL_ptr,
-    W_ptr, stride_wh, stride_wm, stride_wn,
+    # W_ptr, stride_wh, stride_wm, stride_wn,
     logit_scale,
     batch_size,
     token_size,
@@ -141,7 +143,7 @@ def _backward(
             KV_Lock_head_seq_ptr = KV_Lock_ptr + stride_kvs * seq_id + stride_kvh * head_id
             KV_Count_head_seq_ptr = KV_Count_ptr + stride_kvs * seq_id + stride_kvh * head_id
 
-            W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_wm * seq_start_offset
+            # W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_wm * seq_start_offset
 
             _backward_one_row(
                 seq_a_block_id,
@@ -164,7 +166,7 @@ def _backward(
                 DV_head_seq_ptr, stride_dvn, stride_dvd,
                 DLF_head_seq_ptr, stride_dlfn,
                 KV_Lock_head_seq_ptr, KV_Count_head_seq_ptr,
-                W_head_seq_ptr, stride_wm, stride_wn,
+                # W_head_seq_ptr, stride_wm, stride_wn,
                 logit_scale,
                 BLOCK_D,
                 NO_D_MASK,
@@ -194,7 +196,7 @@ def _backward(
             KV_Lock_head_seq_ptr = KV_Lock_ptr + stride_kvs * seq_id + stride_kvh * head_id
             KV_Count_head_seq_ptr = KV_Count_ptr + stride_kvs * seq_id + stride_kvh * head_id
             
-            W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_wm * seq_start_offset
+            # W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_wm * seq_start_offset
 
             _backward_one_row(
                 seq_b_block_id,
@@ -217,7 +219,7 @@ def _backward(
                 DV_head_seq_ptr, stride_dvn, stride_dvd,
                 DLF_head_seq_ptr, stride_dlfn,
                 KV_Lock_head_seq_ptr, KV_Count_head_seq_ptr,
-                W_head_seq_ptr, stride_wm, stride_wn,
+                # W_head_seq_ptr, stride_wm, stride_wn,
                 logit_scale,
                 BLOCK_D,
                 NO_D_MASK,
@@ -252,7 +254,7 @@ def _backward_one_row(
     DV_head_seq_ptr, stride_dvn, stride_dvd,
     DLF_head_seq_ptr, stride_dlfn,
     KV_Lock_head_seq_ptr, KV_Count_head_seq_ptr,
-    W_head_seq_ptr, stride_wm, stride_wn,
+    # W_head_seq_ptr, stride_wm, stride_wn,
     logit_scale,
     BLOCK_D: tl.constexpr,
     NO_D_MASK: tl.constexpr,
@@ -360,29 +362,42 @@ def _backward_one_row(
             grad_prev_acc[:, None]
         )
         grad_prev_acc += tl.sum(att_dA, axis=1)
+
         # dlog_om_beta = torch.einsum('bhij,kj->bhik', dlog_att, cm)     # correct
         # dlog_beta2 = -dlog_om_beta * torch.exp(log_beta - log_om_beta) # correct
         # dlog_beta = dlog_att + dlog_beta2                              # correct
         # dlogits = dlog_beta * (1 - torch.exp(log_beta_1))              # correct
+
         dlog_beta2 = - dlog_om_beta * tl.exp2(log_beta - log_om_beta)
         dlog_beta1 = att_dA
         dlog_beta = dlog_beta1 + dlog_beta2
+
+        if on_band:
+            if attend_current:
+                block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
+            else:
+                block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
+            dlog_beta = tl.where(block_mask, dlog_beta, 0.0)
+
         dqk = dlog_beta * (1 - tl.exp2(log_beta1))
         dq = tl.dot(dqk.to(k.dtype), k, acc=dq, allow_tf32=ALLOW_TF32)
         block_dk = tl.dot(tl.trans(dqk).to(q.dtype), q, allow_tf32=ALLOW_TF32) * logit_scale
+        block_dlf = tl.sum(dlog_beta, axis=0)
 
-        tl.store(
-            W_head_seq_ptr + stride_wm * M_blk_idxs[:, None] + stride_wn * N_blk_idxs[None, :], p,
-            mask=(M_blk_idxs < seq_length)[:, None] & (N_blk_idxs < seq_length)[None, :],
-        )
+        # tl.store(
+        #     W_head_seq_ptr + stride_wm * M_blk_idxs[:, None] + stride_wn * N_blk_idxs[None, :], p,
+        #     mask=(M_blk_idxs < seq_length)[:, None] & (N_blk_idxs < seq_length)[None, :],
+        # )
 
         locked_add(
             KV_Lock_head_seq_ptr + i, KV_Count_head_seq_ptr + i,
             DK_blk_ptrs, block_dk,
             DV_blk_ptrs, block_dv,
+            DLF_blk_ptrs, block_dlf,
             N_mask, NO_N_MASK,
             D_mask, NO_D_MASK,
         )
+
         # --- End gradient stuff ---
         N_blk_idxs += BLOCK_N
         N_blk_idxs_start += BLOCK_N
@@ -479,7 +494,7 @@ def _compileable_backward(
 ) -> None:
     BLOCK_D = triton.next_power_of_2(dim_size)
 
-    W = torch.full((num_heads, token_size, token_size), 0.0, dtype=torch.float32, device=q.device)
+    # W = torch.full((num_heads, token_size, token_size), 0.0, dtype=torch.float32, device=q.device)
     _backward[num_sequences, num_folded_heads, num_seq_blocks](
         # DO_ptr, stride_doh, stride_dom, stride_dod,
         do, do.stride(0), do.stride(1), do.stride(2),
@@ -509,7 +524,7 @@ def _compileable_backward(
         dkdv_lock.stride(0),
         dkdv_lock.stride(1),
         cu_seqlens,
-        W, W.stride(0), W.stride(1), W.stride(2),
+        # W, W.stride(0), W.stride(1), W.stride(2),
         logit_scale=logit_scale,
         batch_size=batch_size,
         token_size=token_size,
@@ -527,6 +542,6 @@ def _compileable_backward(
         attend_current=attend_current
     )
 
-    from matplotlib import pyplot as plt
-    plt.imshow(W[0].cpu(), interpolation='none')
-    plt.savefig('attn.png')
+    # from matplotlib import pyplot as plt
+    # plt.imshow(W[0].cpu(), interpolation='none')
+    # plt.savefig('attn.png')

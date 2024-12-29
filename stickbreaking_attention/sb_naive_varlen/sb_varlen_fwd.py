@@ -7,7 +7,7 @@ from .softplus import softplus
 from ..utils import custom_op
 
 inv_log2: tl.constexpr = inv_log2
-ALLOW_TF32: tl.constexpr = False
+# ALLOW_TF32: tl.constexpr = True
 
 @triton.jit
 def load_kv(K_blk_ptrs, V_blk_ptrs, LF_blk_ptrs,
@@ -52,11 +52,13 @@ def compute_block(
 
     log_beta = log_beta1 + log_beta2
     log_om_beta = tl.math.log2(1 - tl.math.exp2(log_beta))
+
     if on_band: # diagonal
         if attend_current:
             block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
         else:
             block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
+
         log_om_beta = tl.where(block_mask, log_om_beta, 0.0)
         log_beta1 = tl.where(block_mask, log_beta1, 0.0)
         if backward:
