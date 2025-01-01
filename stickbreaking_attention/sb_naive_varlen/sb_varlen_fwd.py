@@ -7,7 +7,6 @@ from .softplus import softplus
 from ..utils import custom_op
 
 inv_log2: tl.constexpr = inv_log2
-# ALLOW_TF32: tl.constexpr = True
 
 @triton.jit
 def load_kv(K_blk_ptrs, V_blk_ptrs, LF_blk_ptrs,
@@ -51,14 +50,26 @@ def compute_block(
     log_beta2 = inv_log2 * lf[None, :]
 
     log_beta = log_beta1 + log_beta2
-    log_om_beta = tl.math.log2(1 - tl.math.exp2(log_beta))
+
+    # Log-safe version of the following:
+    #  beta = tl.math.exp2(log_beta)
+    #  om_beta = 1 - beta
+    #  log_om_beta = tl.math.log2(om_beta)
+    _x = -qk 
+    term_1  = tl.where(
+        _x < 15.0,
+        tl.math.log2((1 - tl.exp2(log_beta2)) + tl.math.exp2(_x)),
+        _x
+    )
+    log_om_beta = term_1 + log_beta1
+    log_ratio = log_beta2 - term_1
+    # End
 
     if on_band: # diagonal
         if attend_current:
             block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
         else:
             block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
-
         log_om_beta = tl.where(block_mask, log_om_beta, 0.0)
         log_beta1 = tl.where(block_mask, log_beta1, 0.0)
         if backward:
@@ -85,7 +96,7 @@ def compute_block(
     if not backward:
         neg_log_acc += tl.sum(log_om_beta, axis=1)
 
-    return p, log_beta1, log_beta2, log_beta, log_om_beta, neg_log_acc
+    return p, log_beta1, log_beta2, log_beta, log_om_beta, log_ratio, neg_log_acc
 
 
 @triton.jit
@@ -188,7 +199,7 @@ def _forward_one_row(
             NO_D_MASK=NO_D_MASK,
         )
 
-        p, log_beta1, log_beta2, log_beta, log_om_beta, neg_log_acc = compute_block(
+        p, log_beta1, log_beta2, log_beta, log_om_beta, log_ratio, neg_log_acc = compute_block(
             q,
             k,
             lf,

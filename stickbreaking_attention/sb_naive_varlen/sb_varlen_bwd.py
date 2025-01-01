@@ -4,11 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
-from ..utils import ALLOW_TF32, inv_log2
-from .sb_varlen_fwd import compute_block, load_kv
+from ..utils import inv_log2, log2
+from .sb_varlen_fwd import compute_block, load_kv, ALLOW_TF32
 
 from ..utils import custom_op
-
 
 
 @triton.jit
@@ -334,7 +333,7 @@ def _backward_one_row(
             NO_D_MASK=NO_D_MASK,
         )
 
-        p, log_beta1, log_beta2, log_beta, log_om_beta, neg_log_acc = compute_block(
+        p, log_beta1, log_beta2, log_beta, log_om_beta, log_ratio, neg_log_acc = compute_block(
             q, k, lf,
             qk_scale,
             neg_log_acc,
@@ -353,9 +352,8 @@ def _backward_one_row(
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
-        block_dv = tl.dot(tl.trans(p), do.to(p.dtype), allow_tf32=ALLOW_TF32) # correct
 
-        att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32))#  - dr[:, None])
+        att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
         att_dA = att_dA.to(cm.dtype)
         dlog_om_beta = (
             tl.dot(att_dA, fwd_cm, allow_tf32=ALLOW_TF32) - att_dA +
@@ -368,19 +366,21 @@ def _backward_one_row(
         # dlog_beta = dlog_att + dlog_beta2                              # correct
         # dlogits = dlog_beta * (1 - torch.exp(log_beta_1))              # correct
 
-        dlog_beta2 = - dlog_om_beta * tl.exp2(log_beta - log_om_beta)
+        dlog_beta2 = -dlog_om_beta * tl.exp2(log_ratio)
         dlog_beta1 = att_dA
         dlog_beta = dlog_beta1 + dlog_beta2
-
-        if on_band:
+        dqk = dlog_beta * (1 - tl.exp2(log_beta1))
+        if on_band or not NO_M_MASK:
             if attend_current:
                 block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
             else:
                 block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
-            dlog_beta = tl.where(block_mask, dlog_beta, 0.0)
+            mask = M_mask[:, None] & block_mask
+            dlog_beta = tl.where(mask, dlog_beta, 0.0)
+            # dqk = tl.where(mask, dqk, 0.)
 
-        dqk = dlog_beta * (1 - tl.exp2(log_beta1))
         dq = tl.dot(dqk.to(k.dtype), k, acc=dq, allow_tf32=ALLOW_TF32)
+        block_dv = tl.dot(tl.trans(p), do.to(p.dtype), allow_tf32=ALLOW_TF32) # correct
         block_dk = tl.dot(tl.trans(dqk).to(q.dtype), q, allow_tf32=ALLOW_TF32) * logit_scale
         block_dlf = tl.sum(dlog_beta, axis=0)
 
