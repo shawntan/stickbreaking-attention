@@ -352,6 +352,10 @@ def _backward_one_row(
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
+        # dlog_om_beta = torch.einsum('bhij,kj->bhik', dlog_att, cm)     # correct
+        # dlog_beta2 = -dlog_om_beta * torch.exp(log_beta - log_om_beta) # correct
+        # dlog_beta = dlog_att + dlog_beta2                              # correct
+        # dlogits = dlog_beta * (1 - torch.exp(log_beta_1))              # correct
 
         att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
         att_dA = att_dA.to(cm.dtype)
@@ -360,16 +364,18 @@ def _backward_one_row(
             grad_prev_acc[:, None]
         )
         grad_prev_acc += tl.sum(att_dA, axis=1)
-
-        # dlog_om_beta = torch.einsum('bhij,kj->bhik', dlog_att, cm)     # correct
-        # dlog_beta2 = -dlog_om_beta * torch.exp(log_beta - log_om_beta) # correct
-        # dlog_beta = dlog_att + dlog_beta2                              # correct
-        # dlogits = dlog_beta * (1 - torch.exp(log_beta_1))              # correct
-
-        dlog_beta2 = -dlog_om_beta * tl.exp2(log_ratio)
+        
+        dlog_beta2 = tl.where(
+            tl.abs(dlog_om_beta) > 0.,
+            -dlog_om_beta * tl.exp2(log_ratio),
+            # log_ratio is large and +ve, 1 - beta is close to 0
+            # -> then dlog_om_beta is also likely close to 0, because beta is 1,
+            # -> p will be 0.
+            # -> att_dA = 0
+            0.
+        )
         dlog_beta1 = att_dA
         dlog_beta = dlog_beta1 + dlog_beta2
-        dqk = dlog_beta * (1 - tl.exp2(log_beta1))
         if on_band or not NO_M_MASK:
             if attend_current:
                 block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
@@ -378,7 +384,8 @@ def _backward_one_row(
             mask = M_mask[:, None] & block_mask
             dlog_beta = tl.where(mask, dlog_beta, 0.0)
             # dqk = tl.where(mask, dqk, 0.)
-
+        dqk = dlog_beta * (1 - tl.exp2(log_beta1))
+        # tl.device_print('dqk', tl.sum(dqk))
         dq = tl.dot(dqk.to(k.dtype), k, acc=dq, allow_tf32=ALLOW_TF32)
         block_dv = tl.dot(tl.trans(p), do.to(p.dtype), allow_tf32=ALLOW_TF32) # correct
         block_dk = tl.dot(tl.trans(dqk).to(q.dtype), q, allow_tf32=ALLOW_TF32) * logit_scale

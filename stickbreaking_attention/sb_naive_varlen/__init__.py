@@ -55,6 +55,31 @@ class StickBreakingAttention(torch.autograd.Function):
             BLOCK_M=BWD_BLOCK_M,
             BLOCK_N=BWD_BLOCK_N,
         )
+
+        # if (
+        #     torch.isinf(dq).any() or torch.isnan(dq).any() or
+        #     torch.isinf(dk).any() or torch.isnan(dk).any() or
+        #     torch.isinf(dv).any() or torch.isnan(dv).any() or
+        #     torch.isinf(dlf).any() or torch.isnan(dlf).any()
+        # ):
+
+        #     rank = torch.distributed.get_rank()
+        #     torch.save(
+        #         (
+        #             do, drem,
+        #             q, k, v, log_forget,
+        #             cu_seqlens,
+        #             max_seqlens,
+        #             neg_log_acc,
+        #             logit_scale,
+        #             attend_current,
+        #             BWD_BLOCK_M,
+        #             BWD_BLOCK_N,
+        #         ),
+        #         open(f'naninfbwd_{rank}.pkl', 'wb')
+        #     )
+        #     exit()
+
         return dq, dk, dv, dlf, None, None, None, None
 
 

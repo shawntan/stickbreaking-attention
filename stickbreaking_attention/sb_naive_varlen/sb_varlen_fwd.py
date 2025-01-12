@@ -55,15 +55,23 @@ def compute_block(
     #  beta = tl.math.exp2(log_beta)
     #  om_beta = 1 - beta
     #  log_om_beta = tl.math.log2(om_beta)
-    _x = -qk 
+    no_forget_mask = log_beta2 == 0.
+    _x = -qk
+    beta2 = tl.exp2(log_beta2)
     term_1  = tl.where(
-        _x < 15.0,
-        tl.math.log2((1 - tl.exp2(log_beta2)) + tl.math.exp2(_x)),
+        (_x < 15.0) & (beta2 < 1.),
+        tl.math.log2(
+            (1 - beta2) + tl.math.exp2(_x)
+        ),
         _x
     )
+    # log_om_beta = tl.where(no_forget_mask, _x + log_beta1, term_1 + log_beta1)
+    # log_ratio = tl.where(no_forget_mask, qk, log_beta2 - term_1)
     log_om_beta = term_1 + log_beta1
     log_ratio = log_beta2 - term_1
     # End
+    # if print_logits:
+    #     tl.device_print("_x", tl.max(tl.abs(_x)))
 
     if on_band: # diagonal
         if attend_current:
@@ -92,6 +100,7 @@ def compute_block(
             log_p = tl.dot(log_om_beta.to(q.dtype), cm,acc=log_p, allow_tf32=ALLOW_TF32)
         log_p -= log_om_beta.to(q.dtype)
         p = tl.math.exp2(log_p)
+
 
     if not backward:
         neg_log_acc += tl.sum(log_om_beta, axis=1)
@@ -177,7 +186,6 @@ def _forward_one_row(
     neg_log_acc = tl.zeros([BLOCK_M], dtype=acc_dtype)
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=acc_dtype)
     # --- End band vectors ---
-
     # Iterate only up to start of sequence
     for i in range(iters):
         N_blk_idxs -= BLOCK_N
@@ -219,12 +227,13 @@ def _forward_one_row(
         acc = tl.dot(p.to(v.dtype), v, acc, allow_tf32=ALLOW_TF32)
         if return_attention:  # TODO write returns_attention_weight
             tl.store(
-                W_head_seq_ptr + stride_wm *
-                M_blk_idxs[:, None] + stride_wn * N_blk_idxs[None, :],
+                W_head_seq_ptr + stride_wm * M_blk_idxs[:, None] + stride_wn * N_blk_idxs[None, :],
                 p,
-                mask=(M_blk_idxs < seq_length)[:, None] & (
-                    N_blk_idxs < seq_length)[None, :],
+                mask=(M_blk_idxs < seq_length)[:, None] & ( N_blk_idxs < seq_length)[None, :],
+        
             )
+
+    # tl.device_print("max acc", tl.max(acc))
     if NO_M_MASK:
         tl.store(R_blk_ptrs, tl.math.exp2(neg_log_acc))
         tl.store(A_blk_ptrs, neg_log_acc.to(A_head_seq_ptr.type.element_ty))
@@ -338,7 +347,7 @@ def _forward(
             O_head_seq_ptr = O_ptr + stride_oh * head_id + stride_om * seq_start_offset
             R_head_seq_ptr = R_ptr + stride_rh * head_id + stride_rm * seq_start_offset
             A_head_seq_ptr = A_ptr + stride_ah * head_id + stride_am * seq_start_offset
-            W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_wm * seq_start_offset
+            W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_wm * seq_start_offset + stride_wn * seq_start_offset
             _forward_one_row(
                 seq_a_block_id,
                 seq_length,
@@ -391,7 +400,7 @@ def _forward(
             O_head_seq_ptr = O_ptr + stride_oh * head_id + stride_om * seq_start_offset
             R_head_seq_ptr = R_ptr + stride_rh * head_id + stride_rm * seq_start_offset
             A_head_seq_ptr = A_ptr + stride_ah * head_id + stride_am * seq_start_offset
-            W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_wm * seq_start_offset
+            W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_wm * seq_start_offset + stride_wn * seq_start_offset
             _forward_one_row(
                 seq_b_block_id,
                 seq_length,
@@ -474,9 +483,17 @@ def varlen_fwd(
         attend_current=attend_current
     )
     if return_attention:
-        from matplotlib import pyplot as plt
-        plt.imshow(W[0].cpu(), interpolation='none')
-        plt.savefig('attn.png')
+        # from matplotlib import pyplot as plt
+        # plt.figure(dpi=300)
+        # # print(W[6, 10895, 10678:10895 + 1])
+        # print("Nan locations:")
+        # print(torch.nonzero(torch.isnan(W[6, 10895])))
+        # print(log_forget[6, 10678: 10688])
+        # print(W[6, 10895, 10678 - 2: 10688 + 2])
+        # print((k[6, 10678 - 2: 10688 + 2] @ q[6, 10895]) * logit_scale)
+        # # print(torch.nonzero(torch.isnan(W)))
+        # plt.imshow(W[6].cpu(), interpolation='none')
+        # plt.savefig('attn.png')
         return o, rem, neg_log_acc, W
     else:
         return o, rem, neg_log_acc
