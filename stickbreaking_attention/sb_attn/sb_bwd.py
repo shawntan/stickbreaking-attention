@@ -170,8 +170,8 @@ def _bwd(do, dr, q, k, v, neg_log_acc, logit_scale,
     # dqdkdv = dqdkdv.permute(0, 2, 1, 3)
     # dq, dk, dv = dqdkdv.chunk(3, dim=-1)
     dq = torch.zeros_like(q)
-    dk = torch.zeros_like(k)
-    dv = torch.zeros_like(v)
+    dk = torch.zeros_like(k, dtype=torch.float32)
+    dv = torch.zeros_like(v, dtype=torch.float32)
 
     M_count = triton.cdiv(token_size, BLOCK_M)
     N_count = M_count * (BLOCK_M // BLOCK_N)

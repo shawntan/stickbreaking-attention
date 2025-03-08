@@ -9,19 +9,17 @@ from .sb_varlen_fwd import compute_block, load_kv
 
 from ..utils import custom_op
 
-
 @triton.jit
-# TODO add two-step lock?
-def _locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr,
+def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr,
                EVICTION_POLICY: tl.constexpr=""):
     while tl.atomic_cas(Lock_ptr, 0, 1) == 1:
         pass
-    tl.device_print("Start locked add.")
+    # tl.device_print("Start locked add.")
     count = tl.load(Count_ptr, eviction_policy=EVICTION_POLICY)
     if NO_D_MASK:
         if NO_N_MASK:
             if count == 0:
-                tl.store(Count_ptr, True, eviction_policy=EVICTION_POLICY)
+                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
             else:
                 a += tl.load(A_ptrs, eviction_policy=EVICTION_POLICY)
                 b += tl.load(B_ptrs, eviction_policy=EVICTION_POLICY)
@@ -30,7 +28,7 @@ def _locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_
 
         else:
             if count == 0:
-                tl.store(Count_ptr, True, eviction_policy=EVICTION_POLICY)
+                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
             else:
                 a += tl.load(A_ptrs,
                              mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
@@ -42,21 +40,21 @@ def _locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_
                      eviction_policy=EVICTION_POLICY)
 
     else:
-        mask = N_mask[:, None] & D_mask[None, :]
-        if count == 0:
-            tl.store(Count_ptr, True, eviction_policy=EVICTION_POLICY)
-        else:
-            a += tl.load(A_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
-            b += tl.load(B_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
-        tl.store(A_ptrs, a, mask=mask, eviction_policy=EVICTION_POLICY)
-        tl.store(B_ptrs, b, mask=mask, eviction_policy=EVICTION_POLICY)
+    # if True: # TODO  delete
+         mask = N_mask[:, None] & D_mask[None, :]
+         if count == 0:
+             tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
+         else:
+             a += tl.load(A_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
+             b += tl.load(B_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
+         tl.store(A_ptrs, a, mask=mask, eviction_policy=EVICTION_POLICY)
+         tl.store(B_ptrs, b, mask=mask, eviction_policy=EVICTION_POLICY)
 
-    tl.device_print("End locked add.")
+    # tl.device_print("End locked add.")
     tl.atomic_xchg(Lock_ptr, 0)
 
 @triton.jit
-# TODO add two-step lock?
-def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr,
+def _locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr,
                EVICTION_POLICY: tl.constexpr=""):
     # count = tl.load(Count_ptr, eviction_policy=EVICTION_POLICY)
     if NO_D_MASK:
@@ -507,17 +505,12 @@ def varlen_bwd(
     # dqdkdv = dqdkdv.permute(1, 0, 2)
     # dq, dk, dv = dqdkdv.chunk(3, dim=-1)
     dq = torch.zeros_like(q)
-    dk = torch.zeros_like(k, dtype=torch.float32)
-    dv = torch.zeros_like(v, dtype=torch.float32)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
 
     num_sequences = batch_size
     num_folded_heads = triton.cdiv(num_heads, 2)
     num_seq_blocks = triton.cdiv(max_seqlens, BLOCK_M) + 1
-    N_count = num_seq_blocks * (BLOCK_M // BLOCK_N)
-    dkdv_lock = torch.zeros(
-        (num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
-    dkdv_count = torch.zeros(
-        (num_sequences, num_heads, N_count), dtype=torch.bool, device=q.device)
     _compileable_backward(
         do,
         dr,
@@ -536,8 +529,8 @@ def varlen_bwd(
         dq,
         dk,
         dv,
-        dkdv_lock,
-        dkdv_count,
+        # dkdv_lock,
+        # dkdv_count,
         num_sequences,
         num_folded_heads,
         num_seq_blocks,
@@ -546,7 +539,7 @@ def varlen_bwd(
     return dq, dk, dv
 
 
-@custom_op("varlen_bwd", mutates_args={"dq", "dk", "dv", "dkdv_lock", "dkdv_count"})
+@custom_op("varlen_bwd", mutates_args={"dq", "dk", "dv"})
 def _compileable_backward(
     do: torch.Tensor,
     dr: torch.Tensor,
@@ -565,14 +558,20 @@ def _compileable_backward(
     dq: torch.Tensor,
     dk: torch.Tensor,
     dv: torch.Tensor,
-    dkdv_lock: torch.Tensor,
-    dkdv_count: torch.Tensor,
+    # dkdv_lock: torch.Tensor,
+    # dkdv_count: torch.Tensor,
     num_sequences: int,
     num_folded_heads: int,
     num_seq_blocks: int,
     attend_current: bool = False,
 ) -> None:
     BLOCK_D = triton.next_power_of_2(dim_size)
+    N_count = num_seq_blocks * (BLOCK_M // BLOCK_N)
+    dkdv_lock = torch.zeros(
+        (num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
+    dkdv_count = torch.zeros(
+        (num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
+
     _backward[num_sequences, num_folded_heads, num_seq_blocks](
         # DO_ptr, stride_doh, stride_dom, stride_dod,
         do,
