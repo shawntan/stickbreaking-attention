@@ -45,17 +45,15 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
             Output: T.Buffer(shape, dtype),  # type: ignore
             lse: T.Buffer([batch, heads, seq_len], accum_dtype),  # type: ignore
     ):
-        with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=128) as (bx, by, bz):
 
+        with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=128) as (bx, by, bz):
             cm = T.alloc_shared([block_N, block_N], dtype)
             for i, j in T.Parallel(block_N, block_N):
                 cm[i, j] = T.if_then_else(i < j, 0., 1.)
-
             cm_cast = T.alloc_shared([block_N, block_N], accum_dtype)
             T.copy(cm, cm_cast)
             T.copy(cm_cast, cm_out)
             
-
             # allocate shared mem
             Q_shared = T.alloc_shared([block_M, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)
@@ -64,21 +62,21 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
             # block fragments
             acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
             acc_log_om_beta = T.alloc_fragment([block_M], accum_dtype)
-
             T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
             T.copy(Q[bz, bx * block_M:(bx + 1) * block_M, by, :], Q_shared)
-
             T.fill(acc_o, 0)
             T.fill(acc_log_om_beta, 0)
 
-            qk_scale = T.alloc_fragment([block_M, block_N], accum_dtype)
+            qk_scaled = T.alloc_fragment([block_M, block_N], accum_dtype)
             log_om_beta = T.alloc_fragment([block_M, block_N], accum_dtype)
-            tile_log_om_beta_sum = T.alloc_fragment([block_M], accum_dtype)
             cum_log_om_beta = T.alloc_fragment([block_M, block_N], accum_dtype)
             log_om_beta_cast = T.alloc_fragment([block_M, block_N], dtype)
             log_p = T.alloc_fragment([block_M, block_N], accum_dtype)
             p = T.alloc_fragment([block_M, block_N], accum_dtype)
             p_cast = T.alloc_fragment([block_M, block_N], dtype)
+
+
+            tile_log_om_beta_sum = T.alloc_fragment([block_M], accum_dtype)
 
             T.fill(cum_log_om_beta, 0.)
             loop_range = T.ceildiv((bx + 1) * block_M, block_N) if is_causal else T.ceildiv(seq_len, block_N)
@@ -88,15 +86,14 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
                 T.copy(K[bz, k * block_N:(k + 1) * block_N, by, :], K_shared)
                 T.copy(V[bz, k * block_N:(k + 1) * block_N, by, :], V_shared)
 
-                T.clear(qk_scale)
-                
-                T.gemm(Q_shared, K_shared, qk_scale, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.clear(qk_scaled)
+                T.gemm(Q_shared, K_shared, qk_scaled, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 for i, j in T.Parallel(block_M, block_N):
-                    qk_scale[i, j] = qk_scale[i, j] * scale
+                    qk_scaled[i, j] = qk_scaled[i, j] * scale
                     log_om_beta[i, j] = -T.if_then_else(
-                        qk_scale[i, j] > 15.0,
-                        qk_scale[i, j],
-                        T.log(1 + T.exp(qk_scale[i, j]))
+                        qk_scaled[i, j] > 15.0,
+                        qk_scaled[i, j],
+                        T.log(1 + T.exp(qk_scaled[i, j]))
                     )
 
                     if is_causal:
@@ -105,14 +102,13 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
                             0.,
                             log_om_beta[i, j],
                         )
-                    
-                T.fill(cum_log_om_beta, 0.)
+                    # Init result tile of cumultative with previous acc_log_om_beta
+                    cum_log_om_beta[i, j] = acc_log_om_beta[i]
                 T.copy(log_om_beta, log_om_beta_cast)
                 T.gemm(log_om_beta_cast, cm, cum_log_om_beta , policy=T.GemmWarpPolicy.FullRow)
-
                 for i, j in T.Parallel(block_M, block_N):
-                    cum_log_om_beta[i, j] = cum_log_om_beta[i, j] + acc_log_om_beta[i]
-                    log_p[i, j] = qk_scale[i, j] + cum_log_om_beta[i, j]
+                    # cum_log_om_beta[i, j] = cum_log_om_beta[i, j] + acc_log_om_beta[i]
+                    log_p[i, j] = qk_scaled[i, j] + cum_log_om_beta[i, j]
                     p[i, j] = T.exp(log_p[i, j])
                     if is_causal:
                         p[i, j] = T.if_then_else(
@@ -123,12 +119,9 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
                 T.reduce_sum(log_om_beta, tile_log_om_beta_sum, dim=1)
                 for i in T.Parallel(block_M):
                     acc_log_om_beta[i] = acc_log_om_beta[i] + tile_log_om_beta_sum[i]
-
-               
                 T.copy(p, A[bz, by, bx * block_M:(bx + 1) * block_M,  k * block_N:(k + 1) * block_N])
                 T.copy(p, p_cast)
                 T.gemm(p_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-
             T.copy(acc_o, Output[bz, bx * block_M:(bx + 1) * block_M, by, :])
             T.copy(acc_log_om_beta, lse[bz, by, bx * block_M:(bx + 1) * block_M])
 
@@ -206,8 +199,8 @@ if __name__ == "__main__":
     total_flops = 5 * flops_per_matmul
     if casual:
         total_flops *= 0.5
-    Q = torch.empty(BATCH, N_CTX, H, D_HEAD, dtype=torch.bfloat16, device="cuda").zero_().requires_grad_()
-    K = torch.empty_like(Q).zero_().requires_grad_()
+    Q = torch.empty(BATCH, N_CTX, H, D_HEAD, dtype=torch.float16, device="cuda").normal_().requires_grad_()
+    K = torch.empty_like(Q).normal_().requires_grad_()
     V = torch.empty_like(Q).normal_().requires_grad_()
     dO = torch.randn_like(Q)
     A_ref, O_ref = ref_program(Q, K, V, casual)
@@ -215,10 +208,10 @@ if __name__ == "__main__":
     def print_err(x: torch.Tensor, x_ref: torch.Tensor, rtol=1e-2, atol=1e-2):
         print((x - x_ref).abs().max())
         assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
-    print((A_ref - A)[0, 0].abs().max(dim=1))
-    print((A_ref - A)[0, 0].abs().max(dim=0))
-    print(A_ref[0, 0, 64-5:64+5, 64-5:64+5])
-    print(A[0, 0, 64-5:64+5, 64-5:64+5])
+    # print((A_ref - A)[0, 0].abs().max(dim=1))
+    # print((A_ref - A)[0, 0].abs().max(dim=0))
+    # print(A_ref[0, 0, 64-5:64+5, 64-5:64+5])
+    # print(A[0, 0, 64-5:64+5, 64-5:64+5])
     print_err(O, O_ref, rtol=1e-2, atol=1e-2)
     exit()
     O.backward(dO, retain_graph=True)
