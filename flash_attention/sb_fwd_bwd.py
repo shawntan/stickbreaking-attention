@@ -35,6 +35,35 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
     scale = 1.0 / math.sqrt(dim)
     shape = [batch, seq_len, heads, dim]
     accum_dtype = "float"
+    @T.macro
+    def compute_tile(
+            bx, k,
+            Q_shared: T.Buffer([block_M, dim], accum_dtype), # type: ignore
+            K_shared: T.Buffer([block_M, dim], accum_dtype), # type: ignore
+            qk_scaled: T.Buffer([block_M, block_N], accum_dtype), # type: ignore
+            log_om_beta: T.Buffer([block_M, block_N], accum_dtype), # type: ignore
+            cum_log_om_beta: T.Buffer([block_M, block_N], accum_dtype),  # type: ignore
+            acc_log_om_beta: T.Buffer([block_M], accum_dtype)  # type: ignore
+    ):
+        T.clear(qk_scaled)
+        T.gemm(Q_shared, K_shared, qk_scaled, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+        for i, j in T.Parallel(block_M, block_N):
+            qk_scaled[i, j] = qk_scaled[i, j] * scale
+            log_om_beta[i, j] = -T.if_then_else(
+                qk_scaled[i, j] > 15.0,
+                qk_scaled[i, j],
+                T.log(1 + T.exp(qk_scaled[i, j]))
+            )
+
+            if is_causal:
+                log_om_beta[i, j] = T.if_then_else(
+                    bx * block_M + i <= k * block_N + j,
+                    0.,
+                    log_om_beta[i, j],
+                )
+            # Init result tile of cumultative with previous acc_log_om_beta
+            cum_log_om_beta[i, j] = acc_log_om_beta[i]
+
     @T.prim_func
     def flash_fwd(
             Q: T.Buffer(shape, dtype),  # type: ignore
@@ -45,6 +74,7 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
             Output: T.Buffer(shape, dtype),  # type: ignore
             lse: T.Buffer([batch, heads, seq_len], accum_dtype),  # type: ignore
     ):
+
 
         with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=128) as (bx, by, bz):
             cm = T.alloc_shared([block_N, block_N], dtype)
@@ -85,25 +115,29 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
                 # Load K and V
                 T.copy(K[bz, k * block_N:(k + 1) * block_N, by, :], K_shared)
                 T.copy(V[bz, k * block_N:(k + 1) * block_N, by, :], V_shared)
+                compute_tile(
+                    bx, k, Q_shared, K_shared,
+                    qk_scaled, log_om_beta, cum_log_om_beta, acc_log_om_beta,
+                )
+                # T.clear(qk_scaled)
+                # T.gemm(Q_shared, K_shared, qk_scaled, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                # for i, j in T.Parallel(block_M, block_N):
+                #     qk_scaled[i, j] = qk_scaled[i, j] * scale
+                #     log_om_beta[i, j] = -T.if_then_else(
+                #         qk_scaled[i, j] > 15.0,
+                #         qk_scaled[i, j],
+                #         T.log(1 + T.exp(qk_scaled[i, j]))
+                #     )
 
-                T.clear(qk_scaled)
-                T.gemm(Q_shared, K_shared, qk_scaled, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                for i, j in T.Parallel(block_M, block_N):
-                    qk_scaled[i, j] = qk_scaled[i, j] * scale
-                    log_om_beta[i, j] = -T.if_then_else(
-                        qk_scaled[i, j] > 15.0,
-                        qk_scaled[i, j],
-                        T.log(1 + T.exp(qk_scaled[i, j]))
-                    )
+                #     if is_causal:
+                #         log_om_beta[i, j] = T.if_then_else(
+                #             bx * block_M + i <= k * block_N + j,
+                #             0.,
+                #             log_om_beta[i, j],
+                #         )
+                #     # Init result tile of cumultative with previous acc_log_om_beta
+                #     cum_log_om_beta[i, j] = acc_log_om_beta[i]
 
-                    if is_causal:
-                        log_om_beta[i, j] = T.if_then_else(
-                            bx * block_M + i <= k * block_N + j,
-                            0.,
-                            log_om_beta[i, j],
-                        )
-                    # Init result tile of cumultative with previous acc_log_om_beta
-                    cum_log_om_beta[i, j] = acc_log_om_beta[i]
                 T.copy(log_om_beta, log_om_beta_cast)
                 T.gemm(log_om_beta_cast, cm, cum_log_om_beta , policy=T.GemmWarpPolicy.FullRow)
                 for i, j in T.Parallel(block_M, block_N):
