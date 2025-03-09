@@ -112,27 +112,20 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
 
                 for i, j in T.Parallel(block_M, block_N):
                     cum_log_om_beta[i, j] = cum_log_om_beta[i, j] + acc_log_om_beta[i]
-
-                T.reduce_sum(log_om_beta, tile_log_om_beta_sum, dim=1)
-                for i in T.Parallel(block_M):
-                    acc_log_om_beta[i] = acc_log_om_beta[i] + tile_log_om_beta_sum[i]
-
-                for i, j in T.Parallel(block_M, block_N):
-                    # cum_log_om_beta[i, j] += acc_log_om_beta[i]
-                    # cum_log_om_beta[i, j] = cum_log_om_beta[i, j] + acc_log_om_beta[i]
                     log_p[i, j] = qk_scale[i, j] + cum_log_om_beta[i, j]
                     p[i, j] = T.exp(log_p[i, j])
-                    # p[i, j] = T.exp(log_om_beta[i, j])
                     if is_causal:
                         p[i, j] = T.if_then_else(
                             bx * block_M + i <= k * block_N + j,
                             0.,
                             p[i, j],
                         )
-                
-                # T.copy(cum_log_om_beta[:, 0], acc_log_om_beta)
-                T.copy(p, A[bz, by, bx * block_M:(bx + 1) * block_M,  k * block_N:(k + 1) * block_N])
+                T.reduce_sum(log_om_beta, tile_log_om_beta_sum, dim=1)
+                for i in T.Parallel(block_M):
+                    acc_log_om_beta[i] = acc_log_om_beta[i] + tile_log_om_beta_sum[i]
 
+               
+                T.copy(p, A[bz, by, bx * block_M:(bx + 1) * block_M,  k * block_N:(k + 1) * block_N])
                 T.copy(p, p_cast)
                 T.gemm(p_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
