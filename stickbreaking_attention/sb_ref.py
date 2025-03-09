@@ -22,4 +22,5 @@ def stickbreaking(q, k, v, mask, cum_weight):
         "bhij,jk->bhik", log_beta, cum_weight.to(log_beta))
     log_att = log_z + re_cum_log_beta
     att = log_att.exp()
+    print("hello")
     return att @ v, 1 - att.sum(dim=-1)

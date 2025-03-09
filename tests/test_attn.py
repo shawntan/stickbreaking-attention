@@ -3,9 +3,7 @@ import pytest
 import math
 from stickbreaking_attention.sb_attn import sb_attn
 from transformers import set_seed
-from stickbreaking_attention.sb_ref import stickbreaking
 from .test_varlen import assert_close
-
 
 def ref_fwd(q, k, v, length, attend_current=False):
     cm = torch.ones(length, length).tril(-1).to(q)
