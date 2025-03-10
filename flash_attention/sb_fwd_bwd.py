@@ -68,12 +68,33 @@ def create_compute_tile(scale, inv_log2, dim, block_M, block_N, accum_dtype):
 def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
                   dtype):
     # scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
+    shape = [batch, seq_len, heads, dim]
+    accum_dtype = "float"
+    @T.macro
+    def QK_MM(
+        K: T.Buffer(shape, dtype), # type: ignore
+        Q_shared: T.Buffer([block_M, dim], dtype), # type: ignore
+        K_shared: T.Buffer([block_N, dim], dtype), # type: ignore
+        qk_scaled: T.Buffer([block_M, block_N], accum_dtype), # type: ignore
+        bx: T.int32, by: T.int32, bz: T.int32, k: T.int32,
+    ):
+        T.copy(K[bz, k * block_N:(k + 1) * block_N, by, :], K_shared)
+        if is_causal:
+            for i, j in T.Parallel(block_M, block_N):
+                qk_scaled[i, j] = T.if_then_else(
+                    bx * block_M + i <= k * block_N + j,
+                    -T.infinity(qk_scaled.dtype),
+                    0
+                )
+        else:
+            T.clear(qk_scaled)
+        T.gemm(Q_shared, K_shared, qk_scaled, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+
+
     log2 = math.log(2)
     inv_log2 = 1 / log2
     scale = 1.0 / math.sqrt(dim)
-    shape = [batch, seq_len, heads, dim]
-    accum_dtype = "float"
-    compute_tile = create_compute_tile(scale, inv_log2, dim, block_M, block_N, accum_dtype)
+
     @T.prim_func
     def flash_fwd(
             Q: T.Buffer(shape, dtype),  # type: ignore
@@ -88,7 +109,6 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
             cm = T.alloc_shared([block_N, block_N], dtype)
             for i, j in T.Parallel(block_N, block_N):
                 cm[i, j] = T.if_then_else(i < j, 0., 1.)
-            
             # allocate shared mem
             Q_shared = T.alloc_shared([block_M, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)
@@ -113,20 +133,11 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
  
             tile_log_om_beta_sum = T.alloc_fragment([block_M], accum_dtype)
 
-            T.fill(cum_log_om_beta, 0.)
+            T.fill(log_p, 0.)
             loop_range = T.ceildiv((bx + 1) * block_M, block_N) if is_causal else T.ceildiv(seq_len, block_N)
             for k_rev in T.Pipelined(loop_range, num_stages=1):
                 k = loop_range - k_rev - 1
-                # Load K and V
-                T.copy(K[bz, k * block_N:(k + 1) * block_N, by, :], K_shared)
-                T.copy(V[bz, k * block_N:(k + 1) * block_N, by, :], V_shared)
-                # compute_tile(
-                #     bx, k, Q_shared, K_shared,
-                #     qk_scaled, log_om_beta, cum_log_om_beta, acc_log_om_beta,
-                #     is_causal=is_causal
-                # )
-                T.clear(qk_scaled)
-                T.gemm(Q_shared, K_shared, qk_scaled, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                QK_MM(K, Q_shared, K_shared, qk_scaled, bx, by, bz, k)
                 for i, j in T.Parallel(block_M, block_N):
                     qk_scaled[i, j] = qk_scaled[i, j] * scale * inv_log2
                     log_om_beta[i, j] = -T.if_then_else(
@@ -134,21 +145,13 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
                         qk_scaled[i, j],
                         T.log2(1 + T.exp2(qk_scaled[i, j]))
                     )
-                    cum_log_om_beta[i, j] = acc_log_om_beta[i]
-
-                if is_causal:
-                    for i, j in T.Parallel(block_M, block_N):
-                        log_om_beta[i, j] = T.if_then_else(
-                            bx * block_M + i <= k * block_N + j,
-                            0.,
-                            log_om_beta[i, j],
-                        )
-
+                    # init log_p
+                    log_p[i, j] = acc_log_om_beta[i] + qk_scaled[i, j]
                 T.copy(log_om_beta, log_om_beta_cast)
-                T.gemm(log_om_beta_cast, cm, cum_log_om_beta , policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(log_om_beta_cast, cm, log_p, policy=T.GemmWarpPolicy.FullRow)
                 for i, j in T.Parallel(block_M, block_N):
                     # cum_log_om_beta[i, j] = cum_log_om_beta[i, j] + acc_log_om_beta[i]
-                    log_p[i, j] = qk_scaled[i, j] + cum_log_om_beta[i, j]
+                    # log_p[i, j] = qk_scaled[i, j] + cum_log_om_beta[i, j]
                     # p[i, j] = T.exp(log_p[i, j])
                     if is_causal:
                         p[i, j] = T.if_then_else(
@@ -164,6 +167,7 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
                     acc_log_om_beta[i] = acc_log_om_beta[i] + tile_log_om_beta_sum[i]
                 # T.copy(p, A[bz, by, bx * block_M:(bx + 1) * block_M,  k * block_N:(k + 1) * block_N])
                 T.copy(p, p_cast)
+                T.copy(V[bz, k * block_N:(k + 1) * block_N, by, :], V_shared)
                 T.gemm(p_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
             T.copy(acc_o, Output[bz, bx * block_M:(bx + 1) * block_M, by, :])
             T.copy(acc_log_om_beta, lse[bz, by, bx * block_M:(bx + 1) * block_M])
@@ -247,8 +251,7 @@ def ref_program(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal: bo
     return output
 
 
-
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch', type=int, default=8, help='Batch size')
     parser.add_argument('--h', type=int, default=32, help='Number of heads')
@@ -306,3 +309,6 @@ if __name__ == "__main__":
     print_err(dV, dV_ref, rtol=1e-2, atol=1e-2)
     print_err(dK, dK_ref, rtol=1e-2, atol=1e-2)
     print_err(dQ, dQ_ref, rtol=1e-2, atol=1e-2)
+
+if __name__ == "__main__":
+    main()
