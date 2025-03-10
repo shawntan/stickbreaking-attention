@@ -86,6 +86,7 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
            
             acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
             acc_log_om_beta = T.alloc_fragment([block_M], accum_dtype)
+
             qk_scaled = T.alloc_fragment([block_M, block_N], accum_dtype)
             log_om_beta = T.alloc_fragment([block_M, block_N], accum_dtype)
             log_om_beta_cast = T.alloc_fragment([block_M, block_N], dtype)
@@ -97,7 +98,12 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
             T.fill(acc_log_om_beta, 0)
 
             loop_range = T.ceildiv((bx + 1) * block_M, block_N) if is_causal else T.ceildiv(seq_len, block_N)
-            for k_rev in T.Pipelined(loop_range, num_stages=2):
+            for k_rev in T.Pipelined(
+                loop_range, num_stages=0,
+                # order=[-1, 0, 3, 1, -1, 2],
+                # stage=[-1, 0, 0, 1, -1, 1],
+                # group=[[0], [1, 2], [3, 4, 5, 6, 7, 8, 9, 10], [11], [12], [13]]
+            ):
                 k = loop_range - k_rev - 1
                 QK_MM(K, Q_shared, K_shared, qk_scaled, bx, by, bz, k)
                 for i, j in T.Parallel(block_M, block_N):
@@ -115,10 +121,10 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
                 T.reduce_sum(log_om_beta, tile_log_om_beta_sum, dim=1)
                 for i, j in T.Parallel(block_M, block_N):
                     p[i, j] = T.exp2(log_p[i, j])
-                for i in T.Parallel(block_M):
-                    acc_log_om_beta[i] = acc_log_om_beta[i] + tile_log_om_beta_sum[i]
                 T.copy(V[bz, k * block_N:(k + 1) * block_N, by, :], V_shared)
                 T.gemm(p, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                for i in T.Parallel(block_M):
+                    acc_log_om_beta[i] = acc_log_om_beta[i] + tile_log_om_beta_sum[i]
             T.copy(acc_o, Output[bz, bx * block_M:(bx + 1) * block_M, by, :])
             T.copy(acc_log_om_beta, lse[bz, by, bx * block_M:(bx + 1) * block_M])
 
@@ -204,8 +210,8 @@ def ref_program(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal: bo
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--batch', type=int, default=4, help='Batch size')
-    parser.add_argument('--h', type=int, default=12, help='Number of heads')
+    parser.add_argument('--batch', type=int, default=8, help='Batch size')
+    parser.add_argument('--h', type=int, default=32, help='Number of heads')
     parser.add_argument('--n_ctx', type=int, default=4096, help='Context size')
     parser.add_argument('--d_head', type=int, default=128, help='Head dimension')
     parser.add_argument('--casual', type=bool, default=True, help='Casual flag')
