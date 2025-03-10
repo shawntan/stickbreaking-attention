@@ -13,6 +13,7 @@ import math
 from stickbreaking_attention.sb_attn import sb_attn
 
 import sb_mha_fwd_bshd_wgmma_pipelined
+
 # for reference
 def stickbreaking(q, k, v, mask, cum_weight):
     """
@@ -28,41 +29,6 @@ def stickbreaking(q, k, v, mask, cum_weight):
     att = torch.exp(log_att).masked_fill(mask, 0).to(original_dtype)
 
     return att, att @ v, 1 - att.sum(dim=-1)
-
-
-def create_compute_tile(scale, inv_log2, dim, block_M, block_N, accum_dtype):
-    @T.macro
-    def compute_tile(
-            bx, k,
-            Q_shared: T.Buffer([block_M, dim], accum_dtype), # type: ignore
-            K_shared: T.Buffer([block_M, dim], accum_dtype), # type: ignore
-            qk_scaled: T.Buffer([block_M, block_N], accum_dtype), # type: ignore
-            log_om_beta: T.Buffer([block_M, block_N], accum_dtype), # type: ignore
-            cum_log_om_beta: T.Buffer([block_M, block_N], accum_dtype),  # type: ignore
-            acc_log_om_beta: T.Buffer([block_M], accum_dtype),  # type: ignore
-            is_causal
-    ):
-        T.clear(qk_scaled)
-        T.gemm(Q_shared, K_shared, qk_scaled, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-        for i, j in T.Parallel(block_M, block_N):
-            qk_scaled[i, j] = qk_scaled[i, j] * scale * inv_log2
-            log_om_beta[i, j] = -T.if_then_else(
-                qk_scaled[i, j] > 15.0,
-                qk_scaled[i, j],
-                T.log2(1 + T.exp2(qk_scaled[i, j]))
-            )
-            cum_log_om_beta[i, j] = acc_log_om_beta[i]
-
-        if is_causal:
-            for i, j in T.Parallel(block_M, block_N):
-                log_om_beta[i, j] = T.if_then_else(
-                    bx * block_M + i <= k * block_N + j,
-                    0.,
-                    log_om_beta[i, j],
-                )
-            # Init result tile of cumultative with previous acc_log_om_beta"
-    return compute_tile
-
 
 
 def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
@@ -122,24 +88,21 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
             acc_log_om_beta = T.alloc_fragment([block_M], accum_dtype)
             qk_scaled = T.alloc_fragment([block_M, block_N], accum_dtype)
             log_om_beta = T.alloc_fragment([block_M, block_N], accum_dtype)
-            cum_log_om_beta = T.alloc_fragment([block_M, block_N], accum_dtype)
             log_om_beta_cast = T.alloc_fragment([block_M, block_N], dtype)
             log_p = T.alloc_fragment([block_M, block_N], accum_dtype)
-            p = T.alloc_fragment([block_M, block_N], accum_dtype)
-            p_cast = T.alloc_fragment([block_M, block_N], dtype)
+            p = T.alloc_fragment([block_M, block_N], dtype)
+            tile_log_om_beta_sum = T.alloc_fragment([block_M], accum_dtype)
 
             T.fill(acc_o, 0)
             T.fill(acc_log_om_beta, 0)
- 
-            tile_log_om_beta_sum = T.alloc_fragment([block_M], accum_dtype)
 
-            T.fill(log_p, 0.)
             loop_range = T.ceildiv((bx + 1) * block_M, block_N) if is_causal else T.ceildiv(seq_len, block_N)
-            for k_rev in T.Pipelined(loop_range, num_stages=1):
+            for k_rev in T.Pipelined(loop_range, num_stages=2):
                 k = loop_range - k_rev - 1
                 QK_MM(K, Q_shared, K_shared, qk_scaled, bx, by, bz, k)
                 for i, j in T.Parallel(block_M, block_N):
-                    qk_scaled[i, j] = qk_scaled[i, j] * scale * inv_log2
+                    # qk_scaled[i, j] = qk_scaled[i, j] * scale * inv_log2
+                    qk_scaled[i, j] *= scale * inv_log2
                     log_om_beta[i, j] = -T.if_then_else(
                         qk_scaled[i, j] > 15.0,
                         qk_scaled[i, j],
@@ -149,26 +112,13 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_causal, block_M, block_N,
                     log_p[i, j] = acc_log_om_beta[i] + qk_scaled[i, j]
                 T.copy(log_om_beta, log_om_beta_cast)
                 T.gemm(log_om_beta_cast, cm, log_p, policy=T.GemmWarpPolicy.FullRow)
-                for i, j in T.Parallel(block_M, block_N):
-                    # cum_log_om_beta[i, j] = cum_log_om_beta[i, j] + acc_log_om_beta[i]
-                    # log_p[i, j] = qk_scaled[i, j] + cum_log_om_beta[i, j]
-                    # p[i, j] = T.exp(log_p[i, j])
-                    if is_causal:
-                        p[i, j] = T.if_then_else(
-                            bx * block_M + i <= k * block_N + j,
-                            0.,
-                            T.exp2(log_p[i, j]),
-                        )
-                    else:
-                        p[i, j] = T.exp2(log_p[i, j])
-
                 T.reduce_sum(log_om_beta, tile_log_om_beta_sum, dim=1)
+                for i, j in T.Parallel(block_M, block_N):
+                    p[i, j] = T.exp2(log_p[i, j])
                 for i in T.Parallel(block_M):
                     acc_log_om_beta[i] = acc_log_om_beta[i] + tile_log_om_beta_sum[i]
-                # T.copy(p, A[bz, by, bx * block_M:(bx + 1) * block_M,  k * block_N:(k + 1) * block_N])
-                T.copy(p, p_cast)
                 T.copy(V[bz, k * block_N:(k + 1) * block_N, by, :], V_shared)
-                T.gemm(p_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(p, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
             T.copy(acc_o, Output[bz, bx * block_M:(bx + 1) * block_M, by, :])
             T.copy(acc_log_om_beta, lse[bz, by, bx * block_M:(bx + 1) * block_M])
 
@@ -181,7 +131,8 @@ class _attention(torch.autograd.Function):
     def forward(ctx, q: torch.Tensor, k, v, causal):
         BATCH, N_CTX, H, D_HEAD = q.shape
         block_M = 64
-        block_N = 64 if D_HEAD <= 128 else 32
+        # block_N = 64 if D_HEAD <= 128 else 32
+        block_N = 32
         dtype_str = str(q.dtype).split('.')[-1]
         mod = cached(
             flashattn_fwd, [3, 4],
@@ -253,10 +204,10 @@ def ref_program(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal: bo
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--batch', type=int, default=8, help='Batch size')
-    parser.add_argument('--h', type=int, default=32, help='Number of heads')
-    parser.add_argument('--n_ctx', type=int, default=1024, help='Context size')
-    parser.add_argument('--d_head', type=int, default=64, help='Head dimension')
+    parser.add_argument('--batch', type=int, default=4, help='Batch size')
+    parser.add_argument('--h', type=int, default=12, help='Number of heads')
+    parser.add_argument('--n_ctx', type=int, default=4096, help='Context size')
+    parser.add_argument('--d_head', type=int, default=128, help='Head dimension')
     parser.add_argument('--casual', type=bool, default=True, help='Casual flag')
  
     args = parser.parse_args()
@@ -270,14 +221,17 @@ def main():
     K = torch.empty_like(Q).normal_().requires_grad_()
     V = torch.empty_like(Q).normal_().requires_grad_()
     dO = torch.randn_like(Q)
-    O_ref1 = ref_program_1(Q, K, V, casual)
+    # O_ref1 = ref_program_1(Q, K, V, casual)
     O_ref2 = ref_program(Q, K, V, casual)
     O = attention(Q, K, V, casual)
     def print_err(x: torch.Tensor, x_ref: torch.Tensor, rtol=1e-2, atol=1e-2):
-        print((x - x_ref).abs().max())
+        print((x - x_ref).abs().max().item())
         # assert torch.allclose(x, x_ref, rtol=rtol, atol=atol)
-    print_err(O_ref1, O_ref2, rtol=1e-2, atol=1e-2)
-    print_err(O, O_ref1, rtol=1e-2, atol=1e-2)
+    # print("Pytorch vs. Triton:")
+    # print_err(O_ref1, O_ref2, rtol=1e-2, atol=1e-2)
+    # print("TileLang vs. Pytorch:")
+    # print_err(O, O_ref1, rtol=1e-2, atol=1e-2)
+    print("TileLang vs. Triton:")
     print_err(O, O_ref2, rtol=1e-2, atol=1e-2)
 
     from tilelang.profiler import do_bench
