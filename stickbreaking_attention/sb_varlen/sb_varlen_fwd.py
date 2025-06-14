@@ -88,25 +88,13 @@ def _forward_one_row(
     D_range,
     D_mask,
     cm,
-    Q_head_seq_ptr,
-    stride_qm,
-    stride_qd: tl.constexpr,
-    K_head_seq_ptr,
-    stride_kn,
-    stride_kd: tl.constexpr,
-    V_head_seq_ptr,
-    stride_vn,
-    stride_vd: tl.constexpr,
-    O_head_seq_ptr,
-    stride_om,
-    stride_od: tl.constexpr,
-    R_head_seq_ptr,
-    stride_rm,
-    A_head_seq_ptr,
-    stride_am,
-    W_head_seq_ptr,
-    stride_wm,
-    stride_wn,
+    Q_head_seq_ptr, stride_qm: tl.constexpr, stride_qd: tl.constexpr,
+    K_head_seq_ptr, stride_kn: tl.constexpr, stride_kd: tl.constexpr,
+    V_head_seq_ptr, stride_vn: tl.constexpr, stride_vd: tl.constexpr,
+    O_head_seq_ptr, stride_om: tl.constexpr, stride_od: tl.constexpr,
+    R_head_seq_ptr, stride_rm: tl.constexpr,
+    A_head_seq_ptr, stride_am: tl.constexpr,
+    W_head_seq_ptr, stride_wm: tl.constexpr, stride_wn: tl.constexpr,
     BLOCK_D: tl.constexpr,
     NO_D_MASK: tl.constexpr,
     NO_M_MASK: tl.constexpr,
@@ -132,14 +120,10 @@ def _forward_one_row(
     N_blk_idxs = N_blk_idxs_start + N_range
 
     # Init pointers
-    Q_blk_ptrs = Q_head_seq_ptr + \
-        (stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :])
-    K_blk_ptrs = K_head_seq_ptr + \
-        (stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :])
-    V_blk_ptrs = V_head_seq_ptr + \
-        (stride_vn * N_blk_idxs[:, None] + stride_vd * D_range[None, :])
-    O_blk_ptrs = O_head_seq_ptr + \
-        (stride_om * M_blk_idxs[:, None] + stride_od * D_range[None, :])
+    Q_blk_ptrs = Q_head_seq_ptr + (stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :])
+    K_blk_ptrs = K_head_seq_ptr + (stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :])
+    V_blk_ptrs = V_head_seq_ptr + (stride_vn * N_blk_idxs[:, None] + stride_vd * D_range[None, :])
+    O_blk_ptrs = O_head_seq_ptr + (stride_om * M_blk_idxs[:, None] + stride_od * D_range[None, :])
     R_blk_ptrs = R_head_seq_ptr + stride_rm * M_blk_idxs
     A_blk_ptrs = A_head_seq_ptr + stride_am * M_blk_idxs
 
@@ -158,8 +142,48 @@ def _forward_one_row(
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=acc_dtype)
     # --- End band vectors ---
 
+    on_band_iters: tl.constexpr = BLOCK_M // BLOCK_N
+    tl.static_print(on_band_iters, BLOCK_M, BLOCK_N)
     # Iterate only up to start of sequence
-    for i in range(iters):
+    for i in range(on_band_iters):
+        N_blk_idxs -= BLOCK_N
+        N_blk_idxs_start -= BLOCK_N
+        K_blk_ptrs -= BLOCK_N * stride_kn
+        V_blk_ptrs -= BLOCK_N * stride_vn
+
+        N_mask = N_blk_idxs < seq_length
+        k, v = load_kv(
+            K_blk_ptrs,
+            V_blk_ptrs,
+            N_mask=N_mask,
+            NO_N_MASK=N_blk_idxs_start + BLOCK_N - 1 < seq_length,
+            D_mask=D_mask,
+            NO_D_MASK=NO_D_MASK,
+        )
+        p, _, neg_log_acc = compute_block(
+            q,
+            k,
+            qk_scale,
+            neg_log_acc,
+            M_blk_idxs,
+            N_blk_idxs,
+            cm,
+            on_band=True,
+            ALLOW_TF32=ALLOW_TF32,
+            attend_current=attend_current,
+            backward=False,
+            is_compiling=is_compiling,
+            use_cumsum=use_cumsum,
+        )
+        # Store intermediate values
+        acc = tl.dot(p.to(v.dtype), v, acc, allow_tf32=ALLOW_TF32)
+        if return_attention:  # TODO write returns_attention_weight
+            tl.store(
+                W_head_seq_ptr + stride_wm * M_blk_idxs[:, None] + stride_wn * N_blk_idxs[None, :], p,
+                mask=(M_blk_idxs < seq_length)[:, None] & (N_blk_idxs < seq_length)[None, :],
+            )
+
+    for i in range(on_band_iters, iters):
         N_blk_idxs -= BLOCK_N
         N_blk_idxs_start -= BLOCK_N
         K_blk_ptrs -= BLOCK_N * stride_kn
@@ -183,8 +207,8 @@ def _forward_one_row(
             M_blk_idxs,
             N_blk_idxs,
             cm,
-            on_band,
-            ALLOW_TF32,
+            on_band=False,
+            ALLOW_TF32=ALLOW_TF32,
             attend_current=attend_current,
             backward=False,
             is_compiling=is_compiling,
@@ -200,25 +224,24 @@ def _forward_one_row(
                 mask=(M_blk_idxs < seq_length)[:, None] & (
                     N_blk_idxs < seq_length)[None, :],
             )
+
     if NO_M_MASK:
         tl.store(R_blk_ptrs, tl.math.exp2(neg_log_acc))
         tl.store(A_blk_ptrs, neg_log_acc.to(A_head_seq_ptr.type.element_ty))
     else:
         tl.store(R_blk_ptrs, tl.math.exp2(neg_log_acc), mask=M_mask)
-        tl.store(A_blk_ptrs, neg_log_acc.to(
-            A_head_seq_ptr.type.element_ty), mask=M_mask)
+        tl.store(A_blk_ptrs, neg_log_acc.to(A_head_seq_ptr.type.element_ty), mask=M_mask)
+
     if NO_D_MASK:
-        tl.store(O_blk_ptrs, acc.to(
-            O_head_seq_ptr.type.element_ty), mask=M_mask[:, None])
+        tl.store(O_blk_ptrs, acc.to(O_head_seq_ptr.type.element_ty), mask=M_mask[:, None])
     else:
-        tl.store(O_blk_ptrs, acc.to(O_head_seq_ptr.type.element_ty),
-                 mask=M_mask[:, None] & D_mask[None, :])
+        tl.store(O_blk_ptrs, acc.to(O_head_seq_ptr.type.element_ty), mask=M_mask[:, None] & D_mask[None, :])
 
 
 def get_configs():
-    return [triton.Config({}, num_stages=s, num_warps=w)
-            # for mb in [64, 128]
-            # for nb in [16, 32, 64]
+    return [triton.Config({"BLOCK_M": mb, "BLOCK_N": nb}, num_stages=s, num_warps=w)
+            for mb in [16, 32, 64]
+            for nb in [16, 32, 64]
             for s in [4] # , 2, 3, 5, 6, 7, 8]
             for w in [4]] # , 2]]
             # for mb in [64]
@@ -411,7 +434,9 @@ def _forward(
 
 
 def varlen_fwd(
-    q, k, v, cu_seqlens, max_seqlens, logit_scale, attend_current=False, no_grad=False, return_attention=False, BLOCK_M=64, BLOCK_N=32
+    q, k, v, cu_seqlens, max_seqlens, logit_scale,
+    attend_current=False, no_grad=False, return_attention=False,
+    BLOCK_M=64, BLOCK_N=64
 ):
     batch_size = cu_seqlens.size(0)
     num_heads, token_size, dim_size = q.size()
@@ -518,5 +543,5 @@ def _compileable_forward(
         acc_dtype=tl.float32,
         use_cumsum=False,
         attend_current=attend_current,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
+        # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
     )

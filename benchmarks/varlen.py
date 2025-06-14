@@ -3,6 +3,7 @@ import pytest
 import math
 from torch.nn import functional as F
 from stickbreaking_attention.sb_varlen import sb_attn_varlen
+from stickbreaking_attention.sb_varlen_old import sb_attn_varlen as sb_attn_varlen_old
 import triton
 from flash_attn import flash_attn_varlen_func
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, apply_rotary_pos_emb, rotate_half
@@ -52,6 +53,21 @@ def tri_fwdbwd(do, q, k, v, lengths):
     # o = o + rem[..., None] * v
     return o
 
+def old_tri_fwdbwd(do, q, k, v, lengths):
+    q = q.permute(1, 0, 2)
+    k = k.permute(1, 0, 2)
+    v = v.permute(1, 0, 2)
+    cu_seqlens = torch.cumsum(lengths, dim=-1)
+    o, rem = sb_attn_varlen_old(q, k, v,
+                            cu_seqlens=cu_seqlens,
+                            max_seqlens=max(lengths).item(),
+                            inv_temp=1 / math.sqrt(q.size(-1)),
+                            zero_start=False)
+    # o = o + rem[..., None] * v
+    return o
+
+
+
 def flash_fwdbwd(rope, position_ids, do, q, k, v, lengths):
     cos, sin = rope(v, position_ids)
     q = (q * cos) + (rotate_half(q) * sin)
@@ -75,6 +91,7 @@ def flash_fwdbwd(rope, position_ids, do, q, k, v, lengths):
 providers = [
     # ("reference", "Stickbreaking (ref.)", ("red", "-")),
     ("triton", "Stickbreaking", ("blue", "-")),
+    ("old", "Old Stickbreaking", ("blue", "-")),
     ("flash", "Flash Attention", ("green", "-")),
 ]
 @triton.testing.perf_report([
@@ -111,6 +128,9 @@ def benchmark_varlen(batch_size, num_heads, head_dim, length, dtype, provider, b
         fun = lambda: ref_fwdbwd(do, q, k, v, lengths)
     elif provider == "triton":
         fun = lambda: tri_fwdbwd(do, q, k, v, lengths)
+    elif provider == "old":
+        fun = lambda: old_tri_fwdbwd(do, q, k, v, lengths)
+
     elif provider == "flash":
         config = LlamaConfig(max_position_embeddings=length)
         rope = LlamaRotaryEmbedding(config).to(device)
