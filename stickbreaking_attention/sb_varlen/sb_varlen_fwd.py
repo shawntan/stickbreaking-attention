@@ -8,7 +8,7 @@ from ..utils import custom_op
 
 
 @triton.jit
-def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr):
+def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK: tl.constexpr, D_mask, NO_D_MASK: tl.constexpr):
     if NO_D_MASK:
         if NO_N_MASK:
             k = tl.load(K_blk_ptrs)
@@ -25,9 +25,7 @@ def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.con
 
 @triton.jit
 def compute_block(
-    q,
-    k,
-    qk_scale,
+    q, k, qk_scale,
     neg_log_acc,
     M_blk_idxs,
     N_blk_idxs,
@@ -40,7 +38,6 @@ def compute_block(
     is_compiling: tl.constexpr = False,
 ):
     qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * qk_scale
-
     # log_om_beta (one minus beta) : log(1 - \beta)
     log_om_beta = -softplus(qk, is_compiling=is_compiling)
 
@@ -287,7 +284,8 @@ def _forward(
     acc_dtype: tl.constexpr = tl.float32,
     return_attention: tl.constexpr = False,
     use_cumsum: tl.constexpr = False,
-    attend_current: tl.constexpr = False
+    attend_current: tl.constexpr = False,
+    shared_strides: tl.constexpr = False
 ):
     tl.static_assert(BLOCK_M % BLOCK_N == 0)
 
@@ -296,13 +294,23 @@ def _forward(
     seq_alloc_prog_id = tl.program_id(2)
     num_seq_alloc_progs = tl.num_programs(2)
 
-    shared_strides = (
-        (stride_qd == stride_kd) and 
-        ((stride_kd == stride_vd) and
-         ((stride_vd == stride_od) and
-          ((stride_qm == stride_om) and
-           (stride_kn == stride_vn))))
-    )
+    if shared_strides:
+        stride_kh = stride_qh
+        stride_vh = stride_qh
+        stride_oh = stride_qh
+        stride_kd = stride_qd
+        stride_vd = stride_qd
+        stride_od = stride_qd
+        stride_kn = stride_qm
+        stride_vn = stride_qm
+        stride_om = stride_qm
+    # (
+    #     (stride_qd == stride_kd) and 
+    #     ((stride_kd == stride_vd) and
+    #      ((stride_vd == stride_od) and
+    #       ((stride_qm == stride_om) and
+    #        (stride_kn == stride_vn))))
+    # )
 
     if seq_id == 0:
         seq_start_offset = 0
@@ -485,6 +493,14 @@ def _compileable_forward(
     v_stride = v.stride()
     o_stride = o.stride()
 
+    none_stride = (None, None, None)
+    shared_strides = (v_stride == k_stride) and (q_stride == o_stride)
+    if shared_strides:
+        k_stride = none_stride
+        v_stride = none_stride
+        o_stride = none_stride
+
+
     _forward[grid](
         q, q_stride[0], q_stride[1], q_stride[2],
         k, k_stride[0], k_stride[1], k_stride[2],
@@ -520,5 +536,6 @@ def _compileable_forward(
         acc_dtype=tl.float32,
         use_cumsum=False,
         attend_current=attend_current,
+        shared_strides=shared_strides
         # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
     )
