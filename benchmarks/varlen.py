@@ -104,7 +104,7 @@ providers = [
         styles=[x[2] for x in providers],
         ylabel="ms",
         plot_name=f"triton v torch",
-        args={"batch_size": 4, "num_heads": 12, "head_dim": 128, "dtype": torch.bfloat16, "bwd": True}
+        args={"batch_size": 4, "num_heads": 12, "head_dim": 128, "dtype": torch.bfloat16, "bwd": False}
     )
 ])
 def benchmark_varlen(batch_size, num_heads, head_dim, length, dtype, provider, bwd):

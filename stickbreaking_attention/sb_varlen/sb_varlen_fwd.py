@@ -37,10 +37,9 @@ def compute_block(
     use_cumsum: tl.constexpr = False,
     is_compiling: tl.constexpr = False,
 ):
-    qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * qk_scale
+    p = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * qk_scale
     # log_om_beta (one minus beta) : log(1 - \beta)
-    log_om_beta = -softplus(qk, is_compiling=is_compiling)
-
+    log_om_beta = -softplus(p, is_compiling=is_compiling).to(q.dtype)
     if on_band:  # diagonal
         if attend_current:
             block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
@@ -49,27 +48,26 @@ def compute_block(
         log_om_beta = tl.where(block_mask, log_om_beta, 0.0)
         if backward:
             neg_log_acc -= tl.sum(log_om_beta, axis=1)
-        log_p = qk + neg_log_acc[:, None]
 
+        p += neg_log_acc[:, None]
         if use_cumsum:
-            log_p += tl.cumsum(log_om_beta.to(q.dtype), axis=1, reverse=True)
+            p += tl.cumsum(log_om_beta, axis=1, reverse=True)
         else:
-            log_p = tl.dot(log_om_beta.to(q.dtype), cm,
-                           acc=log_p, allow_tf32=ALLOW_TF32)
+            p = tl.dot(log_om_beta, cm, acc=p, allow_tf32=ALLOW_TF32)
 
-        p = tl.math.exp2(log_p)
+        p = tl.math.exp2(p)
         p = tl.where(block_mask, p, 0.0)
     else:
         if backward:
             neg_log_acc -= tl.sum(log_om_beta, axis=1)
-        log_p = qk + neg_log_acc[:, None]
-        if use_cumsum:
-            log_p += tl.cumsum(log_om_beta.to(q.dtype), axis=1, reverse=True)
-        else:
-            log_p = tl.dot(log_om_beta.to(q.dtype), cm,
-                           acc=log_p, allow_tf32=ALLOW_TF32)
 
-        p = tl.math.exp2(log_p)
+        p = p + neg_log_acc[:, None]
+        if use_cumsum:
+            p += tl.cumsum(log_om_beta, axis=1, reverse=True)
+        else:
+            p = tl.dot(log_om_beta, cm, acc=p, allow_tf32=ALLOW_TF32)
+        p = tl.math.exp2(p)
+
     if not backward:
         neg_log_acc += tl.sum(log_om_beta, axis=1)
     return p, log_om_beta, neg_log_acc
@@ -149,8 +147,10 @@ def _forward_one_row(
     # --- End band vectors ---
 
     on_band_iters: tl.constexpr = BLOCK_M // BLOCK_N
-    tl.static_print(on_band_iters)
+    # tl.static_print(on_band_iters)
     # Iterate only up to start of sequence
+
+    # On Band
     for i in range(on_band_iters):
         N_blk_idxs -= BLOCK_N
         N_blk_idxs_start -= BLOCK_N
@@ -167,9 +167,7 @@ def _forward_one_row(
             NO_D_MASK=NO_D_MASK,
         )
         p, _, neg_log_acc = compute_block(
-            q,
-            k,
-            qk_scale,
+            q, k, qk_scale,
             neg_log_acc,
             M_blk_idxs,
             N_blk_idxs,
@@ -188,7 +186,7 @@ def _forward_one_row(
                 W_head_seq_ptr + stride_wm * M_blk_idxs[:, None] + stride_wn * N_blk_idxs[None, :], p,
                 mask=(M_blk_idxs < seq_length)[:, None] & (N_blk_idxs < seq_length)[None, :],
             )
-
+    # Off band
     for i in range(on_band_iters, iters):
         N_blk_idxs -= BLOCK_N
         N_blk_idxs_start -= BLOCK_N
@@ -200,15 +198,13 @@ def _forward_one_row(
             K_blk_ptrs,
             V_blk_ptrs,
             N_mask=N_mask,
-            NO_N_MASK=N_blk_idxs_start + BLOCK_N - 1 < seq_length,
+            # NO_N_MASK=N_blk_idxs_start + BLOCK_N - 1 < seq_length,
+            NO_N_MASK=True,
             D_mask=D_mask,
             NO_D_MASK=NO_D_MASK,
         )
-        on_band = i < BLOCK_M // BLOCK_N
         p, _, neg_log_acc = compute_block(
-            q,
-            k,
-            qk_scale,
+            q, k, qk_scale,
             neg_log_acc,
             M_blk_idxs,
             N_blk_idxs,
@@ -220,15 +216,15 @@ def _forward_one_row(
             is_compiling=is_compiling,
             use_cumsum=use_cumsum,
         )
+
         # Store intermediate values
         acc = tl.dot(p.to(v.dtype), v, acc, allow_tf32=ALLOW_TF32)
+
         if return_attention:  # TODO write returns_attention_weight
             tl.store(
-                W_head_seq_ptr + stride_wm *
-                M_blk_idxs[:, None] + stride_wn * N_blk_idxs[None, :],
+                W_head_seq_ptr + stride_wm * M_blk_idxs[:, None] + stride_wn * N_blk_idxs[None, :],
                 p,
-                mask=(M_blk_idxs < seq_length)[:, None] & (
-                    N_blk_idxs < seq_length)[None, :],
+                mask=(M_blk_idxs < seq_length)[:, None] & (N_blk_idxs < seq_length)[None, :],
             )
 
     if NO_M_MASK:
@@ -245,9 +241,9 @@ def _forward_one_row(
 
 
 def get_configs():
-    return [triton.Config({"BLOCK_M": mb, "BLOCK_N": nb}, num_stages=s, num_warps=w)
-            for mb in [16, 32, 64]
-            for nb in [16, 32, 64]
+    return [triton.Config({}, num_stages=s, num_warps=w)
+            # for mb in [16, 32, 64]
+            # for nb in [16, 32, 64]
             for s in [4] # , 2, 3, 5, 6, 7, 8]
             for w in [4]] # , 2]]
             # for mb in [64]
@@ -421,7 +417,7 @@ def _forward(
 def varlen_fwd(
     q, k, v, cu_seqlens, max_seqlens, logit_scale,
     attend_current=False, no_grad=False, return_attention=False,
-    BLOCK_M=64, BLOCK_N=64
+    BLOCK_M=64, BLOCK_N=32
 ):
     batch_size = cu_seqlens.size(0)
     num_heads, token_size, dim_size = q.size()
@@ -536,6 +532,6 @@ def _compileable_forward(
         acc_dtype=tl.float32,
         use_cumsum=False,
         attend_current=attend_current,
-        shared_strides=shared_strides
-        # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
+        shared_strides=shared_strides,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
     )
