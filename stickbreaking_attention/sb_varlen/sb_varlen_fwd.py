@@ -108,6 +108,7 @@ def _forward_one_row(
     is_compiling: tl.constexpr = False,
     use_cumsum: tl.constexpr = False,
     attend_current: tl.constexpr = False,
+    shared_strides: tl.constexpr = False
 ):
     # Loading thread information
     block_start_offset = BLOCK_M * seq_block_id
@@ -120,10 +121,18 @@ def _forward_one_row(
     N_blk_idxs = N_blk_idxs_start + N_range
 
     # Init pointers
-    Q_blk_ptrs = Q_head_seq_ptr + (stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :])
-    K_blk_ptrs = K_head_seq_ptr + (stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :])
-    V_blk_ptrs = V_head_seq_ptr + (stride_vn * N_blk_idxs[:, None] + stride_vd * D_range[None, :])
-    O_blk_ptrs = O_head_seq_ptr + (stride_om * M_blk_idxs[:, None] + stride_od * D_range[None, :])
+    if shared_strides:
+        MD_blk_idxs = stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :]
+        ND_blk_idxs = stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :]
+        Q_blk_ptrs = Q_head_seq_ptr + MD_blk_idxs
+        O_blk_ptrs = O_head_seq_ptr + MD_blk_idxs
+        K_blk_ptrs = K_head_seq_ptr + ND_blk_idxs
+        V_blk_ptrs = V_head_seq_ptr + ND_blk_idxs
+    else:
+        Q_blk_ptrs = Q_head_seq_ptr + (stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :])
+        O_blk_ptrs = O_head_seq_ptr + (stride_om * M_blk_idxs[:, None] + stride_od * D_range[None, :])
+        K_blk_ptrs = K_head_seq_ptr + (stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :])
+        V_blk_ptrs = V_head_seq_ptr + (stride_vn * N_blk_idxs[:, None] + stride_vd * D_range[None, :])
     R_blk_ptrs = R_head_seq_ptr + stride_rm * M_blk_idxs
     A_blk_ptrs = A_head_seq_ptr + stride_am * M_blk_idxs
 
@@ -143,7 +152,7 @@ def _forward_one_row(
     # --- End band vectors ---
 
     on_band_iters: tl.constexpr = BLOCK_M // BLOCK_N
-    tl.static_print(on_band_iters, BLOCK_M, BLOCK_N)
+    tl.static_print(on_band_iters)
     # Iterate only up to start of sequence
     for i in range(on_band_iters):
         N_blk_idxs -= BLOCK_N
@@ -254,36 +263,16 @@ def get_configs():
 @triton.autotune(configs=get_configs(), key=["head_size"])
 @triton.jit
 def _forward(
-    Q_ptr,
-    stride_qh: tl.constexpr,
-    stride_qm,
-    stride_qd: tl.constexpr,
-    K_ptr,
-    stride_kh: tl.constexpr,
-    stride_kn,
-    stride_kd: tl.constexpr,
-    V_ptr,
-    stride_vh: tl.constexpr,
-    stride_vn,
-    stride_vd: tl.constexpr,
-    O_ptr,
-    stride_oh: tl.constexpr,
-    stride_om,
-    stride_od: tl.constexpr,
-    R_ptr,
-    stride_rh,
-    stride_rm: tl.constexpr,
-    A_ptr,
-    stride_ah,
-    stride_am: tl.constexpr,
-    W_ptr,
-    stride_wh,
-    stride_wm,
-    stride_wn,
-    CSL_ptr,
-    logit_scale: tl.constexpr,
-    batch_size,
-    token_size,
+    Q_ptr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qd: tl.constexpr,
+    K_ptr, stride_kh: tl.constexpr, stride_kn: tl.constexpr, stride_kd: tl.constexpr,
+    V_ptr, stride_vh: tl.constexpr, stride_vn: tl.constexpr, stride_vd: tl.constexpr,
+    O_ptr, stride_oh: tl.constexpr, stride_om: tl.constexpr, stride_od: tl.constexpr,
+    R_ptr, stride_rh: tl.constexpr, stride_rm: tl.constexpr,
+    A_ptr, stride_ah: tl.constexpr, stride_am: tl.constexpr,
+    W_ptr, stride_wh: tl.constexpr, stride_wm: tl.constexpr, stride_wn: tl.constexpr,
+    CSL_ptr, logit_scale: tl.constexpr,
+    batch_size: tl.constexpr,
+    token_size: tl.constexpr,
     head_size: tl.constexpr,
     num_heads: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -301,10 +290,20 @@ def _forward(
     attend_current: tl.constexpr = False
 ):
     tl.static_assert(BLOCK_M % BLOCK_N == 0)
+
     seq_id = tl.program_id(0)
     fhead_id = tl.program_id(1)
     seq_alloc_prog_id = tl.program_id(2)
     num_seq_alloc_progs = tl.num_programs(2)
+
+    shared_strides = (
+        (stride_qd == stride_kd) and 
+        ((stride_kd == stride_vd) and
+         ((stride_vd == stride_od) and
+          ((stride_qm == stride_om) and
+           (stride_kn == stride_vn))))
+    )
+
     if seq_id == 0:
         seq_start_offset = 0
     else:
@@ -348,25 +347,13 @@ def _forward(
                 D_range,
                 D_mask,
                 cm,
-                Q_head_seq_ptr,
-                stride_qm,
-                stride_qd,
-                K_head_seq_ptr,
-                stride_kn,
-                stride_kd,
-                V_head_seq_ptr,
-                stride_vn,
-                stride_vd,
-                O_head_seq_ptr,
-                stride_om,
-                stride_od,
-                R_head_seq_ptr,
-                stride_rm,
-                A_head_seq_ptr,
-                stride_am,
-                W_head_seq_ptr,
-                stride_wm,
-                stride_wn,
+                Q_head_seq_ptr, stride_qm, stride_qd,
+                K_head_seq_ptr, stride_kn, stride_kd,
+                V_head_seq_ptr, stride_vn, stride_vd,
+                O_head_seq_ptr, stride_om, stride_od,
+                R_head_seq_ptr, stride_rm,
+                A_head_seq_ptr, stride_am,
+                W_head_seq_ptr, stride_wm, stride_wn,
                 BLOCK_D,
                 NO_D_MASK,
                 NO_M_MASK,
@@ -378,7 +365,8 @@ def _forward(
                 acc_dtype,
                 return_attention,
                 use_cumsum=use_cumsum,
-                attend_current=attend_current
+                attend_current=attend_current,
+                shared_strides=shared_strides
             )
         if seq_b_block_id >= 0 and fhead_id * 2 + 1 < num_heads:
             # Reverse head block
@@ -399,25 +387,13 @@ def _forward(
                 D_range,
                 D_mask,
                 cm,
-                Q_head_seq_ptr,
-                stride_qm,
-                stride_qd,
-                K_head_seq_ptr,
-                stride_kn,
-                stride_kd,
-                V_head_seq_ptr,
-                stride_vn,
-                stride_vd,
-                O_head_seq_ptr,
-                stride_om,
-                stride_od,
-                R_head_seq_ptr,
-                stride_rm,
-                A_head_seq_ptr,
-                stride_am,
-                W_head_seq_ptr,
-                stride_wm,
-                stride_wn,
+                Q_head_seq_ptr, stride_qm, stride_qd,
+                K_head_seq_ptr, stride_kn, stride_kd,
+                V_head_seq_ptr, stride_vn, stride_vd,
+                O_head_seq_ptr, stride_om, stride_od,
+                R_head_seq_ptr, stride_rm,
+                A_head_seq_ptr, stride_am,
+                W_head_seq_ptr, stride_wm, stride_wn,
                 BLOCK_D,
                 NO_D_MASK,
                 NO_M_MASK,
@@ -429,7 +405,8 @@ def _forward(
                 acc_dtype,
                 return_attention,
                 use_cumsum=use_cumsum,
-                attend_current=attend_current
+                attend_current=attend_current,
+                shared_strides=shared_strides
             )
 
 
