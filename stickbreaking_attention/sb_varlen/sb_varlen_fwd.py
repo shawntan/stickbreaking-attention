@@ -241,11 +241,16 @@ def _forward_one_row(
 
 
 def get_configs():
-    return [triton.Config({}, num_stages=s, num_warps=w)
-            # for mb in [16, 32, 64]
-            # for nb in [16, 32, 64]
-            for s in [4] # , 2, 3, 5, 6, 7, 8]
-            for w in [4]] # , 2]]
+    return [triton.Config({"BLOCK_M": mb, "BLOCK_N": nb},
+                          num_stages=s, num_warps=w, maxnreg=mnr, 
+                          num_consumer_groups=0,
+                          reg_dec_producer=2,
+                          reg_inc_consumer=2)
+            for mb in [64] # [16, 32, 64, 128]
+            for nb in [32] # [16, 32, 64, 128]
+            for s in [4]
+            for w in [4]
+            for mnr in [256, 512, 1024] if mb % nb == 0]
             # for mb in [64]
             # for nb in [32]
             # for s in [4]
@@ -533,5 +538,5 @@ def _compileable_forward(
         use_cumsum=False,
         attend_current=attend_current,
         shared_strides=shared_strides,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
+        # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
     )
