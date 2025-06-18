@@ -46,30 +46,25 @@ def compute_block(
         else:
             block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
         log_om_beta = tl.where(block_mask, log_om_beta, 0.0)
-        if backward:
-            neg_log_acc -= tl.sum(log_om_beta, axis=1)
-
-        p += neg_log_acc[:, None]
-        if use_cumsum:
-            p += tl.cumsum(log_om_beta, axis=1, reverse=True)
-        else:
-            p = tl.dot(log_om_beta, cm, acc=p, allow_tf32=ALLOW_TF32)
-
-        p = tl.math.exp2(p)
-        p = tl.where(block_mask, p, 0.0)
     else:
-        if backward:
-            neg_log_acc -= tl.sum(log_om_beta, axis=1)
+        block_mask = None
 
-        p = p + neg_log_acc[:, None]
-        if use_cumsum:
-            p += tl.cumsum(log_om_beta, axis=1, reverse=True)
-        else:
-            p = tl.dot(log_om_beta, cm, acc=p, allow_tf32=ALLOW_TF32)
-        p = tl.math.exp2(p)
+    if backward:
+        neg_log_acc -= tl.sum(log_om_beta, axis=1)
+
+    p += neg_log_acc[:, None]
+    if use_cumsum:
+        p += tl.cumsum(log_om_beta, axis=1, reverse=True)
+    else:
+        p = tl.dot(log_om_beta, cm, acc=p, allow_tf32=ALLOW_TF32)
+    p = tl.math.exp2(p)
+
+    if block_mask is not None:
+        p = tl.where(block_mask, p, 0.0)
 
     if not backward:
         neg_log_acc += tl.sum(log_om_beta, axis=1)
+
     return p, log_om_beta, neg_log_acc
 
 
@@ -241,24 +236,42 @@ def _forward_one_row(
 
 
 def get_configs():
-    return [triton.Config({"BLOCK_M": mb, "BLOCK_N": nb},
-                          num_stages=s, num_warps=w, maxnreg=mnr, 
-                          num_consumer_groups=0,
-                          reg_dec_producer=2,
-                          reg_inc_consumer=2)
-            for mb in [64] # [16, 32, 64, 128]
-            for nb in [32] # [16, 32, 64, 128]
+    if True:
+        return [
+            triton.Config(
+                {"BLOCK_M": mb, "BLOCK_N": nb, "use_cumsum": ucs},
+                num_stages=s, num_warps=w, maxnreg=mnr, 
+                num_consumer_groups=0,
+                reg_dec_producer=rdp,
+                reg_inc_consumer=ric
+            )
+            for mb in [16, 32, 64]
+            for nb in [16, 32, 64]
             for s in [4]
             for w in [4]
-            for mnr in [256, 512, 1024] if mb % nb == 0]
-            # for mb in [64]
-            # for nb in [32]
-            # for s in [4]
-            # for w in [4]]
+            for rdp in [1] # [1, 2, 4]
+            for ric in [1] # [1, 2, 4]
+            for mnr in [1024] # [256, 512, 1024]
+            for ucs in [True, False]
+            if nb <= mb and mb % nb == 0 
+        ]
+        # for mb in [64]
+        # for nb in [32]
+        # for s in [4]
+        # for w in [4]]
+    else:
+        return [
+            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32, "use_cumsum": False},
+                          num_stages=4, num_warps=4, maxnreg=1024, 
+                          num_consumer_groups=0,
+                          reg_dec_producer=1,
+                          reg_inc_consumer=1)
+        ]
 
 
 
-@triton.autotune(configs=get_configs(), key=["head_size"])
+
+@triton.autotune(configs=get_configs(), key=["head_size", "max_seqlen"])
 @triton.jit
 def _forward(
     Q_ptr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qd: tl.constexpr,
@@ -270,7 +283,7 @@ def _forward(
     W_ptr, stride_wh: tl.constexpr, stride_wm: tl.constexpr, stride_wn: tl.constexpr,
     CSL_ptr, logit_scale: tl.constexpr,
     batch_size: tl.constexpr,
-    token_size: tl.constexpr,
+    max_seqlen: tl.constexpr,
     head_size: tl.constexpr,
     num_heads: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -286,7 +299,7 @@ def _forward(
     return_attention: tl.constexpr = False,
     use_cumsum: tl.constexpr = False,
     attend_current: tl.constexpr = False,
-    shared_strides: tl.constexpr = False
+    shared_strides: tl.constexpr = False,
 ):
     tl.static_assert(BLOCK_M % BLOCK_N == 0)
 
@@ -521,7 +534,7 @@ def _compileable_forward(
         # pid_debug,
         logit_scale=logit_scale,
         batch_size=batch_size,
-        token_size=token_size,
+        max_seqlen=max_seqlens,
         head_size=dim_size,
         num_heads=num_heads,
         no_grad=no_grad,
@@ -535,7 +548,7 @@ def _compileable_forward(
         inv_log2=inv_log2,
         return_attention=return_attention,
         acc_dtype=tl.float32,
-        use_cumsum=False,
+        # use_cumsum=False,
         attend_current=attend_current,
         shared_strides=shared_strides,
         # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
