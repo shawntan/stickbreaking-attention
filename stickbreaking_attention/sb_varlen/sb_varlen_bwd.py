@@ -384,7 +384,7 @@ def _backward_one_row(
             KV_Lock_ptr + i, KV_Count_ptr + i,
             DK_blk_ptrs, block_dk,
             DV_blk_ptrs, block_dv,
-            N_mask, NO_N_MASK,
+            None, True,
             D_mask, NO_D_MASK,
         )
 
@@ -412,7 +412,7 @@ def _backward_one_row(
             K_blk_ptrs,
             V_blk_ptrs,
             N_mask=N_mask,
-            NO_N_MASK=False,
+            NO_N_MASK=False, # NO_N_MASK,
             D_mask=D_mask,
             NO_D_MASK=NO_D_MASK,
         )
@@ -433,8 +433,8 @@ def _backward_one_row(
 
         # --- Do gradient stuff ---
         att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
-        grad_prev_acc += tl.sum(att_dA, axis=1)
         cumul_att_dA = tl.dot(att_dA.to(cm.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
+        grad_prev_acc += tl.sum(att_dA, axis=1)
         beta = 1 - tl.exp2(log_om_beta)  # 180 -> 175
         dqk = att_dA - beta * cumul_att_dA
         dq = tl.dot(dqk.to(k.dtype), k, acc=dq, allow_tf32=ALLOW_TF32)
