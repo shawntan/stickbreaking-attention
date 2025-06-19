@@ -9,8 +9,8 @@ from torch.nn import functional as F
 
 FWD_BLOCK_M: tl.constexpr = 64
 FWD_BLOCK_N: tl.constexpr = 32
-BWD_BLOCK_M: tl.constexpr = 16
-BWD_BLOCK_N: tl.constexpr = 16
+BWD_BLOCK_M: tl.constexpr = 64
+BWD_BLOCK_N: tl.constexpr = 32
 
 
 def calculate_programs_needed(cu_seqlens: torch.Tensor, BLOCK_SIZE):
@@ -52,11 +52,8 @@ class StickBreakingAttention(torch.autograd.Function):
         attend_current = ctx.attend_current
         q, k, v, neg_log_acc, cu_seqlens = ctx.saved_tensors
         dq, dk, dv = varlen_bwd(
-            do,
-            drem,
-            q,
-            k,
-            v,
+            do, drem,
+            q, k, v,
             cu_seqlens,
             max_seqlens,
             neg_log_acc,

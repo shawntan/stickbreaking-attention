@@ -494,11 +494,11 @@ def _compileable_forward(
     num_seq_blocks = triton.cdiv(max_seqlens, BLOCK_M) + 1
     BLOCK_D = triton.next_power_of_2(dim_size)
     grid = (num_sequences, num_folded_heads, num_seq_blocks)
+
     q_stride = q.stride()
     k_stride = k.stride()
     v_stride = v.stride()
     o_stride = o.stride()
-
     none_stride = (None, None, None)
     shared_strides = (v_stride == k_stride) and (q_stride == o_stride)
     if shared_strides:

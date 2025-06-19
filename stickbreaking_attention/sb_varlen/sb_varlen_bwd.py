@@ -116,7 +116,8 @@ def _backward(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     acc_dtype: tl.constexpr = tl.float32,
-    attend_current: tl.constexpr = False
+    attend_current: tl.constexpr = False,
+    shared_strides: tl.constexpr = False
 ):
     tl.static_assert(BLOCK_M % BLOCK_N == 0)
     seq_id = tl.program_id(0)
@@ -131,9 +132,26 @@ def _backward(
     seq_end_offset = tl.load(CSL_ptr + seq_id).to(tl.int32)
     seq_length = seq_end_offset - seq_start_offset
     num_seq_blocks = tl.cdiv(seq_length, BLOCK_M)
-
     seq_a_block_id = num_seq_blocks - seq_alloc_prog_id - 1
     seq_b_block_id = seq_alloc_prog_id - (num_seq_alloc_progs - num_seq_blocks)
+
+    if shared_strides:
+        stride_kh = stride_qh
+        stride_vh = stride_qh
+        stride_kd = stride_qd
+        stride_vd = stride_qd
+        stride_kn = stride_qm
+        stride_vn = stride_qm
+        stride_dqh = stride_qh
+        stride_dkh = stride_qh
+        stride_dvh = stride_qh
+        stride_dqm = stride_qm
+        stride_dkn = stride_qm
+        stride_dvn = stride_qm
+        stride_dqd = stride_qd
+        stride_dkd = stride_qd
+        stride_dvd = stride_qd
+ 
 
     if seq_a_block_id >= 0 or seq_b_block_id >= 0:
         # Universal stuff
@@ -141,8 +159,9 @@ def _backward(
         N_range = tl.arange(0, BLOCK_N)
         D_range = tl.arange(0, BLOCK_D)
         D_mask = D_range < head_size
-        cm = tl.where(N_range[:, None] >= N_range[None, :],
-                      1.0, 0.0).to(Q_ptr.type.element_ty)
+        cm = tl.where(N_range[:, None] >= N_range[None, :], 1.0, 0.0).to(Q_ptr.type.element_ty)
+        
+       
 
         if seq_a_block_id >= 0:
             head_id = fhead_id * 2
@@ -181,7 +200,8 @@ def _backward(
                 BLOCK_M,
                 BLOCK_N,
                 acc_dtype,
-                attend_current=attend_current
+                attend_current=attend_current,
+                shared_strides=shared_strides
             )
         if seq_b_block_id >= 0 and fhead_id * 2 + 1 < num_heads:
             head_id = fhead_id * 2 + 1
@@ -220,8 +240,8 @@ def _backward(
                 BLOCK_M,
                 BLOCK_N,
                 acc_dtype,
-                attend_current=attend_current
-
+                attend_current=attend_current,
+                shared_strides=shared_strides
             )
 
 
@@ -250,6 +270,7 @@ def _backward_one_row(
     acc_dtype: tl.constexpr = tl.float32,
     is_compiling: tl.constexpr = False,
     attend_current: tl.constexpr = False,
+    shared_strides: tl.constexpr = False
 ):
     # Loading thread information
     block_start_offset = BLOCK_M * seq_prog_id
@@ -261,17 +282,30 @@ def _backward_one_row(
     N_blk_idxs = N_blk_idxs_start + N_range
 
     # Init pointers
-    # Inputs
-    DO_blk_ptrs = DO_head_seq_ptr + (stride_dom * M_blk_idxs[:, None] + stride_dod * D_range[None, :])
-    K_blk_ptrs = K_head_seq_ptr + (stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :])
-    Q_blk_ptrs = Q_head_seq_ptr + (stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :])
-    V_blk_ptrs = V_head_seq_ptr + (stride_vn * N_blk_idxs[:, None] + stride_vd * D_range[None, :])
-    A_blk_ptrs = A_head_seq_ptr + stride_am * M_blk_idxs
+    if shared_strides:
+        MD_blk_idxs = stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :]
+        ND_blk_idxs = stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :]
+        # Inputs
+        DO_blk_ptrs = DO_head_seq_ptr + MD_blk_idxs
+        Q_blk_ptrs = Q_head_seq_ptr + MD_blk_idxs
+        K_blk_ptrs = K_head_seq_ptr + ND_blk_idxs
+        V_blk_ptrs = V_head_seq_ptr + ND_blk_idxs
+        # Outputs
+        DQ_blk_ptrs = DQ_head_seq_ptr + MD_blk_idxs
+        DK_blk_ptrs = DK_head_seq_ptr + ND_blk_idxs
+        DV_blk_ptrs = DV_head_seq_ptr + ND_blk_idxs
+    else:
+        # Inputs
+        DO_blk_ptrs = DO_head_seq_ptr + (stride_dom * M_blk_idxs[:, None] + stride_dod * D_range[None, :])
+        K_blk_ptrs = K_head_seq_ptr + (stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :])
+        Q_blk_ptrs = Q_head_seq_ptr + (stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :])
+        V_blk_ptrs = V_head_seq_ptr + (stride_vn * N_blk_idxs[:, None] + stride_vd * D_range[None, :])
+        # Outputs
+        DQ_blk_ptrs = DQ_head_seq_ptr + (stride_dqm * M_blk_idxs[:, None] + stride_dqd * D_range[None, :])
+        DK_blk_ptrs = DK_head_seq_ptr + (stride_dkn * N_blk_idxs[:, None] + stride_dkd * D_range[None, :])
+        DV_blk_ptrs = DV_head_seq_ptr + (stride_dvn * N_blk_idxs[:, None] + stride_dvd * D_range[None, :])
 
-    # Outputs
-    DQ_blk_ptrs = DQ_head_seq_ptr + (stride_dqm * M_blk_idxs[:, None] + stride_dqd * D_range[None, :])
-    DK_blk_ptrs = DK_head_seq_ptr + (stride_dkn * N_blk_idxs[:, None] + stride_dkd * D_range[None, :])
-    DV_blk_ptrs = DV_head_seq_ptr + (stride_dvn * N_blk_idxs[:, None] + stride_dvd * D_range[None, :])
+    A_blk_ptrs = A_head_seq_ptr + stride_am * M_blk_idxs
     DR_blk_ptrs = DR_head_seq_ptr + stride_drm * M_blk_idxs
 
     # --- Load band vectors ---
@@ -367,7 +401,7 @@ def _backward_one_row(
             K_blk_ptrs,
             V_blk_ptrs,
             N_mask=N_mask,
-            NO_N_MASK=(N_blk_idxs_start + BLOCK_N - 1) < seq_length,
+            NO_N_MASK=NO_N_MASK,
             # N_mask=N_mask, NO_N_MASK=False,
             D_mask=D_mask,
             NO_D_MASK=NO_D_MASK,
@@ -512,50 +546,54 @@ def _compileable_backward(
     dkdv_count = torch.zeros(
         (num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
 
+    q_stride = q.stride()
+    k_stride = k.stride()
+    v_stride = v.stride()
+    do_stride = do.stride()
+    dq_stride = dq.stride()
+    dk_stride = dk.stride()
+    dv_stride = dv.stride()
+
+    none_stride = (None, None, None)
+
+    shared_strides = (
+        (v_stride == k_stride) and 
+        (q_stride == k_stride) and 
+        (dk_stride == k_stride) and
+        (do_stride == dk_stride) and
+        (dv_stride == dq_stride)
+    )
+    if shared_strides:
+        k_stride = none_stride
+        v_stride = none_stride
+        assert (dv_stride == dk_stride) and (dq_stride ==  do_stride)
+        do_stride = none_stride
+        dq_stride = none_stride
+        dk_stride = none_stride
+        dv_stride = none_stride
+
+
+
+
     _backward[num_sequences, num_folded_heads, num_seq_blocks](
         # DO_ptr, stride_doh, stride_dom, stride_dod,
-        do,
-        do.stride(0),
-        do.stride(1),
-        do.stride(2),
+        do, do.stride(0), do.stride(1), do.stride(2),
         # DR_ptr, stride_drh, stride_drm,
-        dr,
-        dr.stride(0),
-        dr.stride(1),
+        dr, dr.stride(0), dr.stride(1),
         # A_ptr, stride_ah, stride_am,
-        neg_log_acc,
-        neg_log_acc.stride(0),
-        neg_log_acc.stride(1),
+        neg_log_acc, neg_log_acc.stride(0), neg_log_acc.stride(1),
         # Q_ptr, stride_qh, stride_qm, stride_qd,
-        q,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
+        q, q_stride[0], q_stride[1], q_stride[2],
         # K_ptr, stride_kh, stride_kn, stride_kd,
-        k,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
+        k, k_stride[0], k_stride[1], k_stride[2],
         # V_ptr, stride_vh, stride_vn, stride_vd,
-        v,
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
+        v, v_stride[0], v_stride[1], v_stride[2],
         # DQ_ptr, stride_dqh, stride_dqm, stride_dqd,
-        dq,
-        dq.stride(0),
-        dq.stride(1),
-        dq.stride(2),
+        dq, dq_stride[0], dq_stride[1], dq_stride[2],
         # DK_ptr, stride_dkh, stride_dkn, stride_dkd,
-        dk,
-        dk.stride(0),
-        dk.stride(1),
-        dk.stride(2),
+        dk, dk_stride[0], dk_stride[1], dk_stride[2],
         # DV_ptr, stride_dvh, stride_dvn, stride_dvd,
-        dv,
-        dv.stride(0),
-        dv.stride(1),
-        dv.stride(2),
+        dv, dv_stride[0], dv_stride[1], dv_stride[2],
         # KV_Lock_ptr, KV_Count_ptr, stride_kvl,
         dkdv_lock,
         dkdv_count,
@@ -577,5 +615,6 @@ def _compileable_backward(
         ALLOW_TF32=ALLOW_TF32,
         inv_log2=inv_log2,
         attend_current=attend_current,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        shared_strides=shared_strides,
     )
