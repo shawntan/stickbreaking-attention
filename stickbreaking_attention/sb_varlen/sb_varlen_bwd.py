@@ -305,7 +305,61 @@ def _backward_one_row(
     # if (last_N_blk_idxs_end - sequence_start_offset) % BLOCK_N > 0:
     #     tl.device_print('remainder')
     # Iterate only up to start of sequence
-    for i in range(iters):
+    for i in range(iters - (BLOCK_M // BLOCK_N)):
+        # N_mask = N_blk_idxs < seq_length
+        # NO_N_MASK = (N_blk_idxs_start + BLOCK_N - 1) < seq_length
+        # --- Recompute block ---
+        k, v = load_kv(
+            K_blk_ptrs,
+            V_blk_ptrs,
+            N_mask=None, NO_N_MASK=True,
+            D_mask=D_mask,
+            NO_D_MASK=NO_D_MASK,
+        )
+
+        p, log_om_beta, neg_log_acc = compute_block(
+            q, k, qk_scale,
+            neg_log_acc,
+            M_blk_idxs, N_blk_idxs,
+            cm,
+            on_band=False,
+            ALLOW_TF32=ALLOW_TF32,
+            attend_current=attend_current,
+            backward=True,
+            is_compiling=is_compiling,
+        )
+
+        if not NO_M_MASK:
+            neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
+
+        # --- Do gradient stuff ---
+        att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
+        cumul_att_dA = tl.dot(att_dA.to(cm.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
+        grad_prev_acc += tl.sum(att_dA, axis=1)
+        beta = 1 - tl.exp2(log_om_beta)  # 180 -> 175
+        dqk = att_dA - beta * cumul_att_dA
+        dq = tl.dot(dqk.to(k.dtype), k, acc=dq, allow_tf32=ALLOW_TF32)
+        block_dk = tl.dot(tl.trans(dqk).to(q.dtype), q, allow_tf32=ALLOW_TF32) * logit_scale
+        block_dv = tl.dot(tl.trans(p), do.to(p.dtype), allow_tf32=ALLOW_TF32)
+
+        locked_add(
+            KV_Lock_ptr + i, KV_Count_ptr + i,
+            DK_blk_ptrs, block_dk,
+            DV_blk_ptrs, block_dv,
+            None, True,
+            D_mask, NO_D_MASK,
+        )
+
+        # --- End gradient stuff ---
+        N_blk_idxs += BLOCK_N
+        N_blk_idxs_start += BLOCK_N
+        K_blk_ptrs += BLOCK_N * stride_kn
+        V_blk_ptrs += BLOCK_N * stride_vn
+        DK_blk_ptrs += BLOCK_N * stride_dkn
+        DV_blk_ptrs += BLOCK_N * stride_dvn
+
+    i = iters - (BLOCK_M // BLOCK_N)
+    for j in range(BLOCK_M // BLOCK_N):
         N_mask = N_blk_idxs < seq_length
         NO_N_MASK = (N_blk_idxs_start + BLOCK_N - 1) < seq_length
         # --- Recompute block ---
@@ -318,68 +372,37 @@ def _backward_one_row(
             D_mask=D_mask,
             NO_D_MASK=NO_D_MASK,
         )
-        if (iters - i - 1) < BLOCK_M // BLOCK_N:
-            p, log_om_beta, neg_log_acc = compute_block(
-                q,
-                k,
-                qk_scale,
-                neg_log_acc,
-                M_blk_idxs,
-                N_blk_idxs,
-                cm,
-                on_band=True,
-                ALLOW_TF32=ALLOW_TF32,
-                attend_current=attend_current,
-                backward=True,
-                is_compiling=is_compiling,
-            )
-        else:
-            p, log_om_beta, neg_log_acc = compute_block(
-                q,
-                k,
-                qk_scale,
-                neg_log_acc,
-                M_blk_idxs,
-                N_blk_idxs,
-                cm,
-                on_band=False,
-                ALLOW_TF32=ALLOW_TF32,
-                attend_current=attend_current,
-                backward=True,
-                is_compiling=is_compiling,
-            )
+        p, log_om_beta, neg_log_acc = compute_block(
+            q, k, qk_scale,
+            neg_log_acc,
+            M_blk_idxs, N_blk_idxs,
+            cm,
+            on_band=True,
+            ALLOW_TF32=ALLOW_TF32,
+            attend_current=attend_current,
+            backward=True,
+            is_compiling=is_compiling,
+        )
 
         if not NO_M_MASK:
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
-        att_dA = p * \
-            (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
-        cumul_att_dA = (
-            tl.dot(att_dA.to(cm.dtype), fwd_cm,
-                   allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
-        )  # 180 -> 174
-        # cumul_att_dA = tl.cumsum(att_dA, axis=1) + grad_prev_acc[:, None] # 180 -> 174
+        att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
+        cumul_att_dA = tl.dot(att_dA.to(cm.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
         grad_prev_acc += tl.sum(att_dA, axis=1)
         beta = 1 - tl.exp2(log_om_beta)  # 180 -> 175
         dqk = att_dA - beta * cumul_att_dA
-
         dq = tl.dot(dqk.to(k.dtype), k, acc=dq, allow_tf32=ALLOW_TF32)
-        block_dk = tl.dot(tl.trans(dqk).to(q.dtype), q,
-                          allow_tf32=ALLOW_TF32) * logit_scale
+        block_dk = tl.dot(tl.trans(dqk).to(q.dtype), q, allow_tf32=ALLOW_TF32) * logit_scale
         block_dv = tl.dot(tl.trans(p), do.to(p.dtype), allow_tf32=ALLOW_TF32)
 
         locked_add(
-            KV_Lock_ptr + i,
-            KV_Count_ptr + i,
-            DK_blk_ptrs,
-            block_dk,
-            DV_blk_ptrs,
-            block_dv,
-            N_mask,
-            NO_N_MASK,
-            D_mask,
-            NO_D_MASK,
+            KV_Lock_ptr + i, KV_Count_ptr + i,
+            DK_blk_ptrs, block_dk,
+            DV_blk_ptrs, block_dv,
+            N_mask, NO_N_MASK,
+            D_mask, NO_D_MASK,
         )
 
         # --- End gradient stuff ---
@@ -389,9 +412,9 @@ def _backward_one_row(
         V_blk_ptrs += BLOCK_N * stride_vn
         DK_blk_ptrs += BLOCK_N * stride_dkn
         DV_blk_ptrs += BLOCK_N * stride_dvn
+        i += 1
 
     dq = (logit_scale * dq).to(DQ_head_seq_ptr.type.element_ty)
-
     if NO_D_MASK:
         tl.store(DQ_blk_ptrs, dq, mask=M_mask[:, None])
     else:

@@ -25,12 +25,9 @@ def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.con
 
 @triton.jit
 def compute_block(
-    q,
-    k,
-    qk_scale,
+    q, k, qk_scale,
     neg_log_acc,
-    M_blk_idxs,
-    N_blk_idxs,
+    M_blk_idxs, N_blk_idxs,
     cm,
     on_band: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
@@ -40,7 +37,6 @@ def compute_block(
     is_compiling: tl.constexpr = False,
 ):
     qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * qk_scale
-
     # log_om_beta (one minus beta) : log(1 - \beta)
     log_om_beta = -softplus(qk, is_compiling=is_compiling)
 
@@ -50,29 +46,21 @@ def compute_block(
         else:
             block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
         log_om_beta = tl.where(block_mask, log_om_beta, 0.0)
-        if backward:
-            neg_log_acc -= tl.sum(log_om_beta, axis=1)
-        log_p = qk + neg_log_acc[:, None]
-
-        if use_cumsum:
-            log_p += tl.cumsum(log_om_beta.to(q.dtype), axis=1, reverse=True)
-        else:
-            log_p = tl.dot(log_om_beta.to(q.dtype), cm,
-                           acc=log_p, allow_tf32=ALLOW_TF32)
-
-        p = tl.math.exp2(log_p)
-        p = tl.where(block_mask, p, 0.0)
     else:
-        if backward:
-            neg_log_acc -= tl.sum(log_om_beta, axis=1)
-        log_p = qk + neg_log_acc[:, None]
-        if use_cumsum:
-            log_p += tl.cumsum(log_om_beta.to(q.dtype), axis=1, reverse=True)
-        else:
-            log_p = tl.dot(log_om_beta.to(q.dtype), cm,
-                           acc=log_p, allow_tf32=ALLOW_TF32)
+        block_mask = None
 
-        p = tl.math.exp2(log_p)
+    if backward:
+        neg_log_acc -= tl.sum(log_om_beta, axis=1)
+    log_p = qk + neg_log_acc[:, None]
+    if use_cumsum:
+        log_p += tl.cumsum(log_om_beta.to(q.dtype), axis=1, reverse=True)
+    else:
+        log_p = tl.dot(log_om_beta.to(q.dtype), cm, acc=log_p, allow_tf32=ALLOW_TF32)
+    p = tl.math.exp2(log_p)
+
+    if block_mask is not None:
+        p = tl.where(block_mask, p, 0.0)
+
     if not backward:
         neg_log_acc += tl.sum(log_om_beta, axis=1)
     return p, log_om_beta, neg_log_acc
