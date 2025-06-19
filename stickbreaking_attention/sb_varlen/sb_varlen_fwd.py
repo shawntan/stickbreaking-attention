@@ -8,7 +8,7 @@ from ..utils import custom_op
 
 
 @triton.jit
-def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK: tl.constexpr, D_mask, NO_D_MASK: tl.constexpr):
+def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr):
     if NO_D_MASK:
         if NO_N_MASK:
             k = tl.load(K_blk_ptrs)
@@ -25,7 +25,9 @@ def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK: tl.constexpr, D_mask, NO_
 
 @triton.jit
 def compute_block(
-    q, k, qk_scale,
+    q,
+    k,
+    qk_scale,
     neg_log_acc,
     M_blk_idxs,
     N_blk_idxs,
@@ -37,34 +39,42 @@ def compute_block(
     use_cumsum: tl.constexpr = False,
     is_compiling: tl.constexpr = False,
 ):
-    p = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * qk_scale
+    qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * qk_scale
+
     # log_om_beta (one minus beta) : log(1 - \beta)
-    log_om_beta = -softplus(p, is_compiling=is_compiling).to(q.dtype)
+    log_om_beta = -softplus(qk, is_compiling=is_compiling)
+
     if on_band:  # diagonal
         if attend_current:
             block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
         else:
             block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
         log_om_beta = tl.where(block_mask, log_om_beta, 0.0)
-    else:
-        block_mask = None
+        if backward:
+            neg_log_acc -= tl.sum(log_om_beta, axis=1)
+        log_p = qk + neg_log_acc[:, None]
 
-    if backward:
-        neg_log_acc -= tl.sum(log_om_beta, axis=1)
+        if use_cumsum:
+            log_p += tl.cumsum(log_om_beta.to(q.dtype), axis=1, reverse=True)
+        else:
+            log_p = tl.dot(log_om_beta.to(q.dtype), cm,
+                           acc=log_p, allow_tf32=ALLOW_TF32)
 
-    p += neg_log_acc[:, None]
-    if use_cumsum:
-        p += tl.cumsum(log_om_beta, axis=1, reverse=True)
-    else:
-        p = tl.dot(log_om_beta, cm, acc=p, allow_tf32=ALLOW_TF32)
-    p = tl.math.exp2(p)
-
-    if block_mask is not None:
+        p = tl.math.exp2(log_p)
         p = tl.where(block_mask, p, 0.0)
+    else:
+        if backward:
+            neg_log_acc -= tl.sum(log_om_beta, axis=1)
+        log_p = qk + neg_log_acc[:, None]
+        if use_cumsum:
+            log_p += tl.cumsum(log_om_beta.to(q.dtype), axis=1, reverse=True)
+        else:
+            log_p = tl.dot(log_om_beta.to(q.dtype), cm,
+                           acc=log_p, allow_tf32=ALLOW_TF32)
 
+        p = tl.math.exp2(log_p)
     if not backward:
         neg_log_acc += tl.sum(log_om_beta, axis=1)
-
     return p, log_om_beta, neg_log_acc
 
 
@@ -307,6 +317,7 @@ def _forward(
     fhead_id = tl.program_id(1)
     seq_alloc_prog_id = tl.program_id(2)
     num_seq_alloc_progs = tl.num_programs(2)
+    qk_scale: tl.constexpr = inv_log2 * logit_scale
 
     if shared_strides:
         stride_kh = stride_qh
@@ -318,18 +329,12 @@ def _forward(
         stride_kn = stride_qm
         stride_vn = stride_qm
         stride_om = stride_qm
-    # (
-    #     (stride_qd == stride_kd) and 
-    #     ((stride_kd == stride_vd) and
-    #      ((stride_vd == stride_od) and
-    #       ((stride_qm == stride_om) and
-    #        (stride_kn == stride_vn))))
-    # )
 
     if seq_id == 0:
         seq_start_offset = 0
     else:
         seq_start_offset = tl.load(CSL_ptr + seq_id - 1).to(tl.int32)
+
     seq_end_offset = tl.load(CSL_ptr + seq_id).to(tl.int32)
     seq_length = seq_end_offset - seq_start_offset
     num_seq_blocks = tl.cdiv(seq_length, BLOCK_M)
@@ -339,7 +344,6 @@ def _forward(
 
     if seq_a_block_id >= 0 or seq_b_block_id >= 0:
         # Universal stuff
-        qk_scale = inv_log2 * logit_scale
         M_range = tl.arange(0, BLOCK_M)
         N_range = tl.arange(0, BLOCK_N)
         D_range = tl.arange(0, BLOCK_D)
@@ -553,3 +557,4 @@ def _compileable_forward(
         shared_strides=shared_strides,
         # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
     )
+

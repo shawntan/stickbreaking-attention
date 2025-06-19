@@ -90,48 +90,20 @@ def get_configs():
 )
 @triton.jit
 def _backward(
-    DO_ptr,
-    stride_doh: tl.constexpr,
-    stride_dom,
-    stride_dod: tl.constexpr,
-    DR_ptr,
-    stride_drh,
-    stride_drm,
-    A_ptr,
-    stride_ah,
-    stride_am,
-    Q_ptr,
-    stride_qh: tl.constexpr,
-    stride_qm,
-    stride_qd: tl.constexpr,
-    K_ptr,
-    stride_kh: tl.constexpr,
-    stride_kn,
-    stride_kd: tl.constexpr,
-    V_ptr,
-    stride_vh: tl.constexpr,
-    stride_vn,
-    stride_vd: tl.constexpr,
-    DQ_ptr,
-    stride_dqh: tl.constexpr,
-    stride_dqm,
-    stride_dqd: tl.constexpr,
-    DK_ptr,
-    stride_dkh: tl.constexpr,
-    stride_dkn,
-    stride_dkd: tl.constexpr,
-    DV_ptr,
-    stride_dvh: tl.constexpr,
-    stride_dvn,
-    stride_dvd: tl.constexpr,
-    KV_Lock_ptr,
-    KV_Count_ptr,
-    stride_kvs,
-    stride_kvh,
+    DO_ptr, stride_doh: tl.constexpr, stride_dom: tl.constexpr, stride_dod: tl.constexpr,
+    DR_ptr, stride_drh: tl.constexpr, stride_drm: tl.constexpr,
+    A_ptr, stride_ah: tl.constexpr, stride_am: tl.constexpr,
+    Q_ptr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qd: tl.constexpr,
+    K_ptr, stride_kh: tl.constexpr, stride_kn: tl.constexpr, stride_kd: tl.constexpr,
+    V_ptr, stride_vh: tl.constexpr, stride_vn: tl.constexpr, stride_vd: tl.constexpr,
+    DQ_ptr, stride_dqh: tl.constexpr, stride_dqm: tl.constexpr, stride_dqd: tl.constexpr,
+    DK_ptr, stride_dkh: tl.constexpr, stride_dkn: tl.constexpr, stride_dkd: tl.constexpr,
+    DV_ptr, stride_dvh: tl.constexpr, stride_dvn: tl.constexpr, stride_dvd: tl.constexpr,
+    KV_Lock_ptr, KV_Count_ptr, stride_kvs: tl.constexpr, stride_kvh: tl.constexpr,
     CSL_ptr,
-    logit_scale,
-    batch_size,
-    token_size,
+    logit_scale: tl.constexpr,
+    batch_size: tl.constexpr,
+    token_size: tl.constexpr,
     head_size: tl.constexpr,
     num_heads: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -151,6 +123,7 @@ def _backward(
     fhead_id = tl.program_id(1)
     seq_alloc_prog_id = tl.program_id(2)
     num_seq_alloc_progs = tl.num_programs(2)
+    qk_scale = inv_log2 * logit_scale
     if seq_id == 0:
         seq_start_offset = 0
     else:
@@ -164,7 +137,6 @@ def _backward(
 
     if seq_a_block_id >= 0 or seq_b_block_id >= 0:
         # Universal stuff
-        qk_scale = inv_log2 * logit_scale
         M_range = tl.arange(0, BLOCK_M)
         N_range = tl.arange(0, BLOCK_N)
         D_range = tl.arange(0, BLOCK_D)
@@ -187,39 +159,18 @@ def _backward(
             KV_Count_head_seq_ptr = KV_Count_ptr + \
                 stride_kvs * seq_id + stride_kvh * head_id
             _backward_one_row(
-                seq_a_block_id,
-                seq_length,
-                qk_scale,
-                M_range,
-                N_range,
-                D_range,
-                D_mask,
+                seq_a_block_id, seq_length, qk_scale,
+                M_range, N_range, D_range, D_mask,
                 cm,
-                DO_head_seq_ptr,
-                stride_dom,
-                stride_dod,
-                DR_head_seq_ptr,
-                stride_drm,
-                A_head_seq_ptr,
-                stride_am,
-                Q_head_seq_ptr,
-                stride_qm,
-                stride_qd,
-                K_head_seq_ptr,
-                stride_kn,
-                stride_kd,
-                V_head_seq_ptr,
-                stride_vn,
-                stride_vd,
-                DQ_head_seq_ptr,
-                stride_dqm,
-                stride_dqd,
-                DK_head_seq_ptr,
-                stride_dkn,
-                stride_dkd,
-                DV_head_seq_ptr,
-                stride_dvn,
-                stride_dvd,
+                DO_head_seq_ptr, stride_dom, stride_dod,
+                DR_head_seq_ptr, stride_drm,
+                A_head_seq_ptr, stride_am,
+                Q_head_seq_ptr, stride_qm, stride_qd,
+                K_head_seq_ptr, stride_kn, stride_kd,
+                V_head_seq_ptr, stride_vn, stride_vd,
+                DQ_head_seq_ptr, stride_dqm, stride_dqd,
+                DK_head_seq_ptr, stride_dkn, stride_dkd,
+                DV_head_seq_ptr, stride_dvn, stride_dvd,
                 KV_Lock_head_seq_ptr,
                 KV_Count_head_seq_ptr,
                 logit_scale,
@@ -247,39 +198,18 @@ def _backward(
             KV_Count_head_seq_ptr = KV_Count_ptr + \
                 stride_kvs * seq_id + stride_kvh * head_id
             _backward_one_row(
-                seq_b_block_id,
-                seq_length,
-                qk_scale,
-                M_range,
-                N_range,
-                D_range,
-                D_mask,
+                seq_b_block_id, seq_length, qk_scale,
+                M_range, N_range, D_range, D_mask,
                 cm,
-                DO_head_seq_ptr,
-                stride_dom,
-                stride_dod,
-                DR_head_seq_ptr,
-                stride_drm,
-                A_head_seq_ptr,
-                stride_am,
-                Q_head_seq_ptr,
-                stride_qm,
-                stride_qd,
-                K_head_seq_ptr,
-                stride_kn,
-                stride_kd,
-                V_head_seq_ptr,
-                stride_vn,
-                stride_vd,
-                DQ_head_seq_ptr,
-                stride_dqm,
-                stride_dqd,
-                DK_head_seq_ptr,
-                stride_dkn,
-                stride_dkd,
-                DV_head_seq_ptr,
-                stride_dvn,
-                stride_dvd,
+                DO_head_seq_ptr, stride_dom, stride_dod,
+                DR_head_seq_ptr, stride_drm,
+                A_head_seq_ptr, stride_am,
+                Q_head_seq_ptr, stride_qm, stride_qd,
+                K_head_seq_ptr, stride_kn, stride_kd,
+                V_head_seq_ptr, stride_vn, stride_vd,
+                DQ_head_seq_ptr, stride_dqm, stride_dqd,
+                DK_head_seq_ptr, stride_dkn, stride_dkd,
+                DV_head_seq_ptr, stride_dvn, stride_dvd,
                 KV_Lock_head_seq_ptr,
                 KV_Count_head_seq_ptr,
                 logit_scale,
@@ -291,47 +221,26 @@ def _backward(
                 BLOCK_N,
                 acc_dtype,
                 attend_current=attend_current
+
             )
 
 
 @triton.jit
 def _backward_one_row(
-    seq_prog_id,
-    seq_length,
-    qk_scale,
-    M_range,
-    N_range,
-    D_range,
-    D_mask,
+    seq_prog_id, seq_length, qk_scale,
+    M_range, N_range, D_range, D_mask,
     cm,
-    DO_head_seq_ptr,
-    stride_dom,
-    stride_dod: tl.constexpr,
-    DR_head_seq_ptr,
-    stride_drm,
-    A_head_seq_ptr,
-    stride_am: tl.constexpr,
-    Q_head_seq_ptr,
-    stride_qm,
-    stride_qd: tl.constexpr,
-    K_head_seq_ptr,
-    stride_kn,
-    stride_kd: tl.constexpr,
-    V_head_seq_ptr,
-    stride_vn,
-    stride_vd: tl.constexpr,
-    DQ_head_seq_ptr,
-    stride_dqm,
-    stride_dqd: tl.constexpr,
-    DK_head_seq_ptr,
-    stride_dkn,
-    stride_dkd: tl.constexpr,
-    DV_head_seq_ptr,
-    stride_dvn,
-    stride_dvd: tl.constexpr,
-    KV_Lock_ptr,
-    KV_Count_ptr,
-    logit_scale,
+    DO_head_seq_ptr, stride_dom: tl.constexpr, stride_dod: tl.constexpr,
+    DR_head_seq_ptr, stride_drm: tl.constexpr,
+    A_head_seq_ptr, stride_am: tl.constexpr,
+    Q_head_seq_ptr, stride_qm: tl.constexpr, stride_qd: tl.constexpr,
+    K_head_seq_ptr, stride_kn: tl.constexpr, stride_kd: tl.constexpr,
+    V_head_seq_ptr, stride_vn: tl.constexpr, stride_vd: tl.constexpr,
+    DQ_head_seq_ptr, stride_dqm: tl.constexpr, stride_dqd: tl.constexpr,
+    DK_head_seq_ptr, stride_dkn: tl.constexpr, stride_dkd: tl.constexpr,
+    DV_head_seq_ptr, stride_dvn: tl.constexpr, stride_dvd: tl.constexpr,
+    KV_Lock_ptr, KV_Count_ptr,
+    logit_scale: tl.constexpr,
     BLOCK_D: tl.constexpr,
     NO_D_MASK: tl.constexpr,
     NO_M_MASK: tl.constexpr,
@@ -353,23 +262,16 @@ def _backward_one_row(
 
     # Init pointers
     # Inputs
-    DO_blk_ptrs = DO_head_seq_ptr + \
-        (stride_dom * M_blk_idxs[:, None] + stride_dod * D_range[None, :])
-
-    K_blk_ptrs = K_head_seq_ptr + \
-        (stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :])
-    Q_blk_ptrs = Q_head_seq_ptr + \
-        (stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :])
-    V_blk_ptrs = V_head_seq_ptr + \
-        (stride_vn * N_blk_idxs[:, None] + stride_vd * D_range[None, :])
+    DO_blk_ptrs = DO_head_seq_ptr + (stride_dom * M_blk_idxs[:, None] + stride_dod * D_range[None, :])
+    K_blk_ptrs = K_head_seq_ptr + (stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :])
+    Q_blk_ptrs = Q_head_seq_ptr + (stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :])
+    V_blk_ptrs = V_head_seq_ptr + (stride_vn * N_blk_idxs[:, None] + stride_vd * D_range[None, :])
     A_blk_ptrs = A_head_seq_ptr + stride_am * M_blk_idxs
+
     # Outputs
-    DQ_blk_ptrs = DQ_head_seq_ptr + \
-        (stride_dqm * M_blk_idxs[:, None] + stride_dqd * D_range[None, :])
-    DK_blk_ptrs = DK_head_seq_ptr + \
-        (stride_dkn * N_blk_idxs[:, None] + stride_dkd * D_range[None, :])
-    DV_blk_ptrs = DV_head_seq_ptr + \
-        (stride_dvn * N_blk_idxs[:, None] + stride_dvd * D_range[None, :])
+    DQ_blk_ptrs = DQ_head_seq_ptr + (stride_dqm * M_blk_idxs[:, None] + stride_dqd * D_range[None, :])
+    DK_blk_ptrs = DK_head_seq_ptr + (stride_dkn * N_blk_idxs[:, None] + stride_dkd * D_range[None, :])
+    DV_blk_ptrs = DV_head_seq_ptr + (stride_dvn * N_blk_idxs[:, None] + stride_dvd * D_range[None, :])
     DR_blk_ptrs = DR_head_seq_ptr + stride_drm * M_blk_idxs
 
     # --- Load band vectors ---
@@ -404,7 +306,6 @@ def _backward_one_row(
     #     tl.device_print('remainder')
     # Iterate only up to start of sequence
     for i in range(iters):
-        on_band = (iters - i - 1) < BLOCK_M // BLOCK_N
         N_mask = N_blk_idxs < seq_length
         NO_N_MASK = (N_blk_idxs_start + BLOCK_N - 1) < seq_length
         # --- Recompute block ---
@@ -417,20 +318,36 @@ def _backward_one_row(
             D_mask=D_mask,
             NO_D_MASK=NO_D_MASK,
         )
-        p, log_om_beta, neg_log_acc = compute_block(
-            q,
-            k,
-            qk_scale,
-            neg_log_acc,
-            M_blk_idxs,
-            N_blk_idxs,
-            cm,
-            on_band,
-            ALLOW_TF32,
-            attend_current=attend_current,
-            backward=True,
-            is_compiling=is_compiling,
-        )
+        if (iters - i - 1) < BLOCK_M // BLOCK_N:
+            p, log_om_beta, neg_log_acc = compute_block(
+                q,
+                k,
+                qk_scale,
+                neg_log_acc,
+                M_blk_idxs,
+                N_blk_idxs,
+                cm,
+                on_band=True,
+                ALLOW_TF32=ALLOW_TF32,
+                attend_current=attend_current,
+                backward=True,
+                is_compiling=is_compiling,
+            )
+        else:
+            p, log_om_beta, neg_log_acc = compute_block(
+                q,
+                k,
+                qk_scale,
+                neg_log_acc,
+                M_blk_idxs,
+                N_blk_idxs,
+                cm,
+                on_band=False,
+                ALLOW_TF32=ALLOW_TF32,
+                attend_current=attend_current,
+                backward=True,
+                is_compiling=is_compiling,
+            )
 
         if not NO_M_MASK:
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)

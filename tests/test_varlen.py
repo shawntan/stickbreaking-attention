@@ -47,14 +47,16 @@ def assert_close(varname, a, b, eps):
     assert not torch.isnan(b).any()
     diff = (a - b).abs()
 
-    max_diff= diff.max()
+    max_diff = diff.max().item()
+    median_diff = diff.median().item()
     if max_diff < eps:
-        print(varname, max_diff.item())
+        print(varname, max_diff)
     else:
-        print(varname, max_diff.item(), diff.median().item())
-        print((diff.sum(0).median(dim=0)[0] > eps).int())
-        err_locs = (diff.sum(0).median(dim=1)[0] > eps).int()
-        print(err_locs, err_locs.sum())
+        print(varname, max_diff, median_diff)
+        # print((diff.sum(0).median(dim=0)[0] > eps).int())
+        err_locs = (diff > eps).max(dim=-1)[0].int()
+        print(err_locs)
+        print(diff)
         assert max_diff < eps, max_diff
 
 
@@ -64,13 +66,13 @@ class TestClass:
     @pytest.mark.parametrize('batch_size', [4, 2, 1])
     @pytest.mark.parametrize('num_heads', [24, 8, 4, 2, 1, 7])
     @pytest.mark.parametrize('head_dim', [64, 32, 16, 50])
-    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 256, 500])
+    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 256, 128, 64, 500])
     # @pytest.mark.parametrize('batch_size', [1])
     # @pytest.mark.parametrize('num_heads', [12, 3])
     # @pytest.mark.parametrize('head_dim', [128])
     # @pytest.mark.parametrize('length', [4096, 8192, 8192 * 2])
     @pytest.mark.parametrize('dtype', [torch.bfloat16])
-    @pytest.mark.parametrize('forward_only', [True])
+    @pytest.mark.parametrize('forward_only', [False])
     @pytest.mark.parametrize('attend_current', [False, True])
     def test_varlen(self, batch_size, num_heads, head_dim, length, attend_current, dtype, forward_only):
         set_seed(1337)

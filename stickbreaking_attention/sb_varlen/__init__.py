@@ -9,8 +9,8 @@ from torch.nn import functional as F
 
 FWD_BLOCK_M: tl.constexpr = 64
 FWD_BLOCK_N: tl.constexpr = 32
-BWD_BLOCK_M: tl.constexpr = 64
-BWD_BLOCK_N: tl.constexpr = 32
+BWD_BLOCK_M: tl.constexpr = 16
+BWD_BLOCK_N: tl.constexpr = 16
 
 
 def calculate_programs_needed(cu_seqlens: torch.Tensor, BLOCK_SIZE):
