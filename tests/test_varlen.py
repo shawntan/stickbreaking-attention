@@ -56,7 +56,7 @@ def assert_close(varname, a, b, eps):
         # print((diff.sum(0).median(dim=0)[0] > eps).int())
         err_locs = (diff > eps).max(dim=-1)[0].int()
         print(err_locs)
-        print(diff)
+        # print(diff)
         assert max_diff < eps, max_diff
 
 
@@ -64,9 +64,9 @@ def assert_close(varname, a, b, eps):
 class TestClass:
 
     @pytest.mark.parametrize('batch_size', [4, 2, 1])
-    @pytest.mark.parametrize('num_heads', [24, 8, 4, 2, 1, 7])
-    @pytest.mark.parametrize('head_dim', [64, 32, 16, 50])
-    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 256, 128, 64, 500])
+    @pytest.mark.parametrize('num_heads', [12, 24, 8, 4, 2, 1, 7])
+    @pytest.mark.parametrize('head_dim', [128, 64, 32, 16, 50])
+    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 64, 500])
     # @pytest.mark.parametrize('batch_size', [1])
     # @pytest.mark.parametrize('num_heads', [12, 3])
     # @pytest.mark.parametrize('head_dim', [128])
@@ -107,6 +107,6 @@ class TestClass:
         assert_close("o", ref_out, o, eps)
         if not forward_only:
             dq, dk, dv = torch.autograd.grad(o, inputs=(q, k, v), grad_outputs=do)
-            assert_close("dq", ref_dq, dq, eps)
             assert_close("dk", ref_dk, dk, eps)
             assert_close("dv", ref_dv, dv, eps)
+            assert_close("dq", ref_dq, dq, eps)

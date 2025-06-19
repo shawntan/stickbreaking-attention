@@ -97,14 +97,14 @@ providers = [
 @triton.testing.perf_report([
     triton.testing.Benchmark(
         x_names=["length"],
-        x_vals=[4096, 2 * 4096, 4 * 4096, 8 * 4096, 16 * 4096],
+        x_vals=[4096, 2 * 4096, 4 * 4096], # , 8 * 4096, 16 * 4096],
         line_arg="provider",
         line_vals=[x[0] for x in providers],
         line_names=[x[1] for x in providers],
         styles=[x[2] for x in providers],
         ylabel="ms",
         plot_name=f"triton v torch",
-        args={"batch_size": 4, "num_heads": 12, "head_dim": 128, "dtype": torch.bfloat16, "bwd": False}
+        args={"batch_size": 4, "num_heads": 12, "head_dim": 128, "dtype": torch.bfloat16, "bwd": True}
     )
 ])
 def benchmark_varlen(batch_size, num_heads, head_dim, length, dtype, provider, bwd):
@@ -112,8 +112,8 @@ def benchmark_varlen(batch_size, num_heads, head_dim, length, dtype, provider, b
     set_seed(1337)
     lengths = torch.randint(length, length + 1, (batch_size,)).to(device=device, dtype=torch.int32)
     total_length = lengths.sum()
-    warmup = 100
-    rep = 1000
+    warmup = 10
+    rep = 100
 
     q = torch.randn((total_length, num_heads, head_dim), device=device, dtype=dtype)
     k = torch.randn((total_length, num_heads, head_dim), device=device, dtype=dtype)

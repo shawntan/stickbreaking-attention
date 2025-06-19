@@ -30,25 +30,29 @@ def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_m
             if count == 0:
                 tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
             else:
-                a += tl.load(A_ptrs,
-                             mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
-                b += tl.load(B_ptrs,
-                             mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
-            tl.store(A_ptrs, a, mask=N_mask[:, None],
-                     eviction_policy=EVICTION_POLICY)
-            tl.store(B_ptrs, b, mask=N_mask[:, None],
-                     eviction_policy=EVICTION_POLICY)
+                a += tl.load(A_ptrs, mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
+                b += tl.load(B_ptrs, mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
+            tl.store(A_ptrs, a, mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
+            tl.store(B_ptrs, b, mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
 
     else:
-    # if True: # TODO  delete
-         mask = N_mask[:, None] & D_mask[None, :]
-         if count == 0:
-             tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
-         else:
-             a += tl.load(A_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
-             b += tl.load(B_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
-         tl.store(A_ptrs, a, mask=mask, eviction_policy=EVICTION_POLICY)
-         tl.store(B_ptrs, b, mask=mask, eviction_policy=EVICTION_POLICY)
+        if NO_N_MASK:
+            if count == 0:
+                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
+            else:
+                a += tl.load(A_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+                b += tl.load(B_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+            tl.store(A_ptrs, a, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+            tl.store(B_ptrs, b, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+        else:
+            mask = N_mask[:, None] & D_mask[None, :]
+            if count == 0:
+                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
+            else:
+                a += tl.load(A_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
+                b += tl.load(B_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
+            tl.store(A_ptrs, a, mask=mask, eviction_policy=EVICTION_POLICY)
+            tl.store(B_ptrs, b, mask=mask, eviction_policy=EVICTION_POLICY)
 
     # tl.device_print("End locked add.")
     tl.atomic_xchg(Lock_ptr, 0)
@@ -78,7 +82,7 @@ def get_configs():
             # for w in [4 , 2]]
             # for mb in [32]
             # for nb in [32]
-            for s in [8]
+            for s in [4]
             for w in [4]]
 
 
@@ -151,6 +155,9 @@ def _backward(
         stride_dqd = stride_qd
         stride_dkd = stride_qd
         stride_dvd = stride_qd
+        stride_doh = stride_qh
+        stride_dod = stride_qd
+        stride_dom = stride_qm
  
 
     if seq_a_block_id >= 0 or seq_b_block_id >= 0:
@@ -161,7 +168,6 @@ def _backward(
         D_mask = D_range < head_size
         cm = tl.where(N_range[:, None] >= N_range[None, :], 1.0, 0.0).to(Q_ptr.type.element_ty)
         
-       
 
         if seq_a_block_id >= 0:
             head_id = fhead_id * 2
@@ -175,8 +181,7 @@ def _backward(
             DK_head_seq_ptr = DK_ptr + stride_dkh * head_id + stride_dkn * seq_start_offset
             DV_head_seq_ptr = DV_ptr + stride_dvh * head_id + stride_dvn * seq_start_offset
             KV_Lock_head_seq_ptr = KV_Lock_ptr + stride_kvs * seq_id + stride_kvh * head_id
-            KV_Count_head_seq_ptr = KV_Count_ptr + \
-                stride_kvs * seq_id + stride_kvh * head_id
+            KV_Count_head_seq_ptr = KV_Count_ptr + stride_kvs * seq_id + stride_kvh * head_id
             _backward_one_row(
                 seq_a_block_id, seq_length, qk_scale,
                 M_range, N_range, D_range, D_mask,
@@ -340,15 +345,14 @@ def _backward_one_row(
     #     tl.device_print('remainder')
     # Iterate only up to start of sequence
     for i in range(iters - (BLOCK_M // BLOCK_N)):
-        # N_mask = N_blk_idxs < seq_length
-        # NO_N_MASK = (N_blk_idxs_start + BLOCK_N - 1) < seq_length
+        N_mask = N_blk_idxs < seq_length
+        NO_N_MASK = (N_blk_idxs_start + BLOCK_N - 1) < seq_length
         # --- Recompute block ---
         k, v = load_kv(
             K_blk_ptrs,
             V_blk_ptrs,
             N_mask=None, NO_N_MASK=True,
-            D_mask=D_mask,
-            NO_D_MASK=NO_D_MASK,
+            D_mask=D_mask, NO_D_MASK=NO_D_MASK,
         )
 
         p, log_om_beta, neg_log_acc = compute_block(
@@ -380,17 +384,24 @@ def _backward_one_row(
             KV_Lock_ptr + i, KV_Count_ptr + i,
             DK_blk_ptrs, block_dk,
             DV_blk_ptrs, block_dv,
-            None, True,
+            N_mask, NO_N_MASK,
             D_mask, NO_D_MASK,
         )
 
         # --- End gradient stuff ---
         N_blk_idxs += BLOCK_N
         N_blk_idxs_start += BLOCK_N
-        K_blk_ptrs += BLOCK_N * stride_kn
-        V_blk_ptrs += BLOCK_N * stride_vn
-        DK_blk_ptrs += BLOCK_N * stride_dkn
-        DV_blk_ptrs += BLOCK_N * stride_dvn
+        if shared_strides:
+            stride_size = BLOCK_N * stride_kn
+            K_blk_ptrs += stride_size
+            V_blk_ptrs += stride_size
+            DK_blk_ptrs += stride_size
+            DV_blk_ptrs += stride_size
+        else:
+            K_blk_ptrs += BLOCK_N * stride_kn
+            V_blk_ptrs += BLOCK_N * stride_vn
+            DK_blk_ptrs += BLOCK_N * stride_dkn
+            DV_blk_ptrs += BLOCK_N * stride_dvn
 
     i = iters - (BLOCK_M // BLOCK_N)
     for j in range(BLOCK_M // BLOCK_N):
@@ -401,8 +412,7 @@ def _backward_one_row(
             K_blk_ptrs,
             V_blk_ptrs,
             N_mask=N_mask,
-            NO_N_MASK=NO_N_MASK,
-            # N_mask=N_mask, NO_N_MASK=False,
+            NO_N_MASK=False,
             D_mask=D_mask,
             NO_D_MASK=NO_D_MASK,
         )
@@ -423,8 +433,8 @@ def _backward_one_row(
 
         # --- Do gradient stuff ---
         att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
-        cumul_att_dA = tl.dot(att_dA.to(cm.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
         grad_prev_acc += tl.sum(att_dA, axis=1)
+        cumul_att_dA = tl.dot(att_dA.to(cm.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
         beta = 1 - tl.exp2(log_om_beta)  # 180 -> 175
         dqk = att_dA - beta * cumul_att_dA
         dq = tl.dot(dqk.to(k.dtype), k, acc=dq, allow_tf32=ALLOW_TF32)
@@ -442,10 +452,17 @@ def _backward_one_row(
         # --- End gradient stuff ---
         N_blk_idxs += BLOCK_N
         N_blk_idxs_start += BLOCK_N
-        K_blk_ptrs += BLOCK_N * stride_kn
-        V_blk_ptrs += BLOCK_N * stride_vn
-        DK_blk_ptrs += BLOCK_N * stride_dkn
-        DV_blk_ptrs += BLOCK_N * stride_dvn
+        if shared_strides:
+            stride_size = BLOCK_N * stride_kn
+            K_blk_ptrs += stride_size
+            V_blk_ptrs += stride_size
+            DK_blk_ptrs += stride_size
+            DV_blk_ptrs += stride_size
+        else:
+            K_blk_ptrs += BLOCK_N * stride_kn
+            V_blk_ptrs += BLOCK_N * stride_vn
+            DK_blk_ptrs += BLOCK_N * stride_dkn
+            DV_blk_ptrs += BLOCK_N * stride_dvn
         i += 1
 
     dq = (logit_scale * dq).to(DQ_head_seq_ptr.type.element_ty)
@@ -486,11 +503,7 @@ def varlen_bwd(
     num_folded_heads = triton.cdiv(num_heads, 2)
     num_seq_blocks = triton.cdiv(max_seqlens, BLOCK_M) + 1
     _compileable_backward(
-        do,
-        dr,
-        q,
-        k,
-        v,
+        do, dr, q, k, v,
         cu_seqlens,
         neg_log_acc,
         logit_scale,
@@ -500,9 +513,7 @@ def varlen_bwd(
         num_heads,
         token_size,
         dim_size,
-        dq,
-        dk,
-        dv,
+        dq, dk, dv,
         # dkdv_lock,
         # dkdv_count,
         num_sequences,
@@ -577,7 +588,7 @@ def _compileable_backward(
 
     _backward[num_sequences, num_folded_heads, num_seq_blocks](
         # DO_ptr, stride_doh, stride_dom, stride_dod,
-        do, do.stride(0), do.stride(1), do.stride(2),
+        do, do_stride[0], do_stride[1], do_stride[2],
         # DR_ptr, stride_drh, stride_drm,
         dr, dr.stride(0), dr.stride(1),
         # A_ptr, stride_ah, stride_am,

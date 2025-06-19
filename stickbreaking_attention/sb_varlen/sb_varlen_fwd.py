@@ -9,17 +9,22 @@ from ..utils import custom_op
 
 @triton.jit
 def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr):
-    if NO_D_MASK:
-        if NO_N_MASK:
+    if NO_N_MASK:
+        if NO_D_MASK:
             k = tl.load(K_blk_ptrs)
             v = tl.load(V_blk_ptrs)
         else:
+            k = tl.load(K_blk_ptrs, mask=D_mask[None, :])
+            v = tl.load(V_blk_ptrs, mask=D_mask[None, :])
+    else:
+        if NO_D_MASK:
             k = tl.load(K_blk_ptrs, mask=N_mask[:, None])
             v = tl.load(V_blk_ptrs, mask=N_mask[:, None])
-    else:
-        mask = N_mask[:, None] & D_mask[None, :]
-        k = tl.load(K_blk_ptrs, mask=mask)
-        v = tl.load(V_blk_ptrs, mask=mask)
+        else:
+            mask = N_mask[:, None] & D_mask[None, :]
+            k = tl.load(K_blk_ptrs, mask=mask)
+            v = tl.load(V_blk_ptrs, mask=mask)
+
     return k, v
 
 
@@ -234,7 +239,7 @@ def _forward_one_row(
 
 
 def get_configs():
-    if True:
+    if False:
         return [
             triton.Config(
                 {"BLOCK_M": mb, "BLOCK_N": nb, "use_cumsum": ucs},
