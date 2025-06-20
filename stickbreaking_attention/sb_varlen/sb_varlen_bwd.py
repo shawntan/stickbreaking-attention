@@ -389,24 +389,14 @@ def _backward_one_row(
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
-        dqk = p.to(do.dtype)
-        block_dv = tl.dot(tl.trans(dqk), do, allow_tf32=ALLOW_TF32)
-        dqk *= tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None]
-        cumul_att_dA = tl.dot(dqk.to(do.dtype), tl.trans(cm), allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
-        grad_prev_acc += tl.sum(dqk, axis=1)
-        neg_beta = tl.exp2(log_om_beta) - 1
-        # dqk = dqk + neg_beta * cumul_att_dA
-        dqk += neg_beta * cumul_att_dA
-        dqk = dqk.to(k.dtype)
-        block_dk = tl.dot(tl.trans(dqk), q, allow_tf32=ALLOW_TF32) * logit_scale
-        locked_add(
+        grad_prev_acc, dq = accumulate_gradients(
             KV_Lock_ptr + i, KV_Count_ptr + i,
-            DK_blk_ptrs, block_dk,
-            DV_blk_ptrs, block_dv,
-            None, True,
-            D_mask, NO_D_MASK,
+            DK_blk_ptrs, DV_blk_ptrs,
+            log_om_beta, p, do, dr, q, k, v,
+            grad_prev_acc, dq, cm,
+            D_mask, NO_D_MASK,   
+            logit_scale, ALLOW_TF32, 
         )
-        dq = tl.dot(dqk, k, acc=dq, allow_tf32=ALLOW_TF32)
         # --- End gradient stuff ---
         if shared_strides:
             stride_size = BLOCK_N * stride_kn
@@ -467,26 +457,14 @@ def _backward_one_row(
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
-        dqk = p.to(do.dtype)
-        block_dv = tl.dot(tl.trans(dqk), do, allow_tf32=ALLOW_TF32)
-        dqk *= tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None]
-        cumul_att_dA = tl.dot(dqk.to(do.dtype), tl.trans(cm), allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
-        grad_prev_acc += tl.sum(dqk, axis=1)
-        neg_beta = tl.exp2(log_om_beta) - 1
-        # dqk = dqk + neg_beta * cumul_att_dA
-        dqk += neg_beta * cumul_att_dA
-        dqk = dqk.to(k.dtype)
-        block_dk = tl.dot(tl.trans(dqk), q, allow_tf32=ALLOW_TF32) * logit_scale
-        locked_add(
+        grad_prev_acc, dq = accumulate_gradients(
             KV_Lock_ptr + i, KV_Count_ptr + i,
-            DK_blk_ptrs, block_dk,
-            DV_blk_ptrs, block_dv,
-            None, True,
-            D_mask, NO_D_MASK,
+            DK_blk_ptrs, DV_blk_ptrs,
+            log_om_beta, p, do, dr, q, k, v,
+            grad_prev_acc, dq, cm,
+            D_mask, NO_D_MASK,   
+            logit_scale, ALLOW_TF32, 
         )
-        dq = tl.dot(dqk, k, acc=dq, allow_tf32=ALLOW_TF32)
-
-
         # --- End gradient stuff ---
         N_blk_idxs += BLOCK_N
         N_blk_idxs_start += BLOCK_N
@@ -509,6 +487,34 @@ def _backward_one_row(
         tl.store(DQ_blk_ptrs, dq, mask=M_mask[:, None])
     else:
         tl.store(DQ_blk_ptrs, dq, mask=M_mask[:, None] & D_mask[None, :])
+
+@triton.jit
+def accumulate_gradients(
+    KV_Lock_ptr, KV_Count_ptr, DK_blk_ptrs, DV_blk_ptrs,
+    log_om_beta, p, do, dr, q, k, v,
+    grad_prev_acc, dq, cm,
+    D_mask, NO_D_MASK,   
+    logit_scale, ALLOW_TF32, 
+):
+    dqk = p.to(do.dtype)
+    block_dv = tl.dot(tl.trans(dqk), do, allow_tf32=ALLOW_TF32)
+    dqk *= tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None]
+    cumul_att_dA = tl.dot(dqk.to(do.dtype), tl.trans(cm), allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
+    grad_prev_acc += tl.sum(dqk, axis=1)
+    neg_beta = tl.exp2(log_om_beta) - 1
+        # dqk = dqk + neg_beta * cumul_att_dA
+    dqk += neg_beta * cumul_att_dA
+    dqk = dqk.to(k.dtype)
+    block_dk = tl.dot(tl.trans(dqk), q, allow_tf32=ALLOW_TF32) * logit_scale
+    locked_add(
+            KV_Lock_ptr, KV_Count_ptr,
+            DK_blk_ptrs, block_dk,
+            DV_blk_ptrs, block_dv,
+            None, True,
+            D_mask, NO_D_MASK,
+        )
+    dq = tl.dot(dqk, k, acc=dq, allow_tf32=ALLOW_TF32)
+    return grad_prev_acc,dq
 
 
 def varlen_bwd(
