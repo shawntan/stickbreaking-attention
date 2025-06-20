@@ -9,6 +9,7 @@ from ..utils import custom_op
 
 @triton.jit
 def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr):
+
     if NO_N_MASK:
         if NO_D_MASK:
             k = tl.load(K_blk_ptrs)
@@ -32,12 +33,10 @@ def load_kv(K_blk_ptrs, V_blk_ptrs, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.con
 def compute_block(
     q, k, qk_scale,
     neg_log_acc,
-    M_blk_idxs, N_blk_idxs,
     cm,
-    on_band: tl.constexpr,
+    block_mask: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
     backward: tl.constexpr,
-    attend_current: tl.constexpr = False,
     use_cumsum: tl.constexpr = False,
     is_compiling: tl.constexpr = False,
 ):
@@ -45,14 +44,8 @@ def compute_block(
     # log_om_beta (one minus beta) : log(1 - \beta)
     log_om_beta = -softplus(qk, is_compiling=is_compiling)
 
-    if on_band:  # diagonal
-        if attend_current:
-            block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
-        else:
-            block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
+    if block_mask is not None:
         log_om_beta = tl.where(block_mask, log_om_beta, 0.0)
-    else:
-        block_mask = None
 
     if backward:
         neg_log_acc -= tl.sum(log_om_beta, axis=1)
@@ -154,8 +147,8 @@ def _forward_one_row(
         N_blk_idxs_start -= BLOCK_N
         K_blk_ptrs -= BLOCK_N * stride_kn
         V_blk_ptrs -= BLOCK_N * stride_vn
-
         N_mask = N_blk_idxs < seq_length
+
         k, v = load_kv(
             K_blk_ptrs,
             V_blk_ptrs,
@@ -164,15 +157,17 @@ def _forward_one_row(
             D_mask=D_mask,
             NO_D_MASK=NO_D_MASK,
         )
+
+        if attend_current:
+            block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
+        else:
+            block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
         p, _, neg_log_acc = compute_block(
             q, k, qk_scale,
             neg_log_acc,
-            M_blk_idxs,
-            N_blk_idxs,
             cm,
-            on_band=True,
+            block_mask=block_mask,
             ALLOW_TF32=ALLOW_TF32,
-            attend_current=attend_current,
             backward=False,
             is_compiling=is_compiling,
             use_cumsum=use_cumsum,
@@ -186,30 +181,19 @@ def _forward_one_row(
             )
     # Off band
     for i in range(on_band_iters, iters):
-        N_blk_idxs -= BLOCK_N
-        N_blk_idxs_start -= BLOCK_N
         K_blk_ptrs -= BLOCK_N * stride_kn
         V_blk_ptrs -= BLOCK_N * stride_vn
-
-        N_mask = N_blk_idxs < seq_length
         k, v = load_kv(
-            K_blk_ptrs,
-            V_blk_ptrs,
-            N_mask=N_mask,
-            # NO_N_MASK=N_blk_idxs_start + BLOCK_N - 1 < seq_length,
-            NO_N_MASK=True,
-            D_mask=D_mask,
-            NO_D_MASK=NO_D_MASK,
+            K_blk_ptrs, V_blk_ptrs,
+            N_mask=None, NO_N_MASK=True,
+            D_mask=D_mask, NO_D_MASK=NO_D_MASK,
         )
         p, _, neg_log_acc = compute_block(
             q, k, qk_scale,
             neg_log_acc,
-            M_blk_idxs,
-            N_blk_idxs,
             cm,
-            on_band=False,
+            block_mask=None,
             ALLOW_TF32=ALLOW_TF32,
-            attend_current=attend_current,
             backward=False,
             is_compiling=is_compiling,
             use_cumsum=use_cumsum,
@@ -217,25 +201,29 @@ def _forward_one_row(
 
         # Store intermediate values
         acc = tl.dot(p.to(v.dtype), v, acc, allow_tf32=ALLOW_TF32)
-
         if return_attention:  # TODO write returns_attention_weight
+            N_blk_idxs -= BLOCK_N
+            N_blk_idxs_start -= BLOCK_N
+            N_mask = N_blk_idxs < seq_length
             tl.store(
                 W_head_seq_ptr + stride_wm * M_blk_idxs[:, None] + stride_wn * N_blk_idxs[None, :],
                 p,
                 mask=(M_blk_idxs < seq_length)[:, None] & (N_blk_idxs < seq_length)[None, :],
             )
 
+    neg_log_acc = neg_log_acc.to(A_head_seq_ptr.type.element_ty)
+    acc = acc.to(O_head_seq_ptr.type.element_ty)
     if NO_M_MASK:
         tl.store(R_blk_ptrs, tl.math.exp2(neg_log_acc))
-        tl.store(A_blk_ptrs, neg_log_acc.to(A_head_seq_ptr.type.element_ty))
+        tl.store(A_blk_ptrs, neg_log_acc)
     else:
         tl.store(R_blk_ptrs, tl.math.exp2(neg_log_acc), mask=M_mask)
-        tl.store(A_blk_ptrs, neg_log_acc.to(A_head_seq_ptr.type.element_ty), mask=M_mask)
+        tl.store(A_blk_ptrs, neg_log_acc, mask=M_mask)
 
     if NO_D_MASK:
-        tl.store(O_blk_ptrs, acc.to(O_head_seq_ptr.type.element_ty), mask=M_mask[:, None])
+        tl.store(O_blk_ptrs, acc, mask=M_mask[:, None])
     else:
-        tl.store(O_blk_ptrs, acc.to(O_head_seq_ptr.type.element_ty), mask=M_mask[:, None] & D_mask[None, :])
+        tl.store(O_blk_ptrs, acc, mask=M_mask[:, None] & D_mask[None, :])
 
 
 def get_configs():
@@ -248,13 +236,13 @@ def get_configs():
                 reg_dec_producer=rdp,
                 reg_inc_consumer=ric
             )
-            for mb in [16, 32, 64]
-            for nb in [16, 32, 64]
-            for s in [4]
-            for w in [4]
-            for rdp in [1] # [1, 2, 4]
-            for ric in [1] # [1, 2, 4]
-            for mnr in [1024] # [256, 512, 1024]
+            for mb in [32, 64]
+            for nb in [32, 64]
+            for s in [4, 8]
+            for w in [4, 8]
+            for rdp in [1, 2, 4, 8]
+            for ric in [1, 2, 4, 8]
+            for mnr in [256, 512, 1024]
             for ucs in [True, False]
             if nb <= mb and mb % nb == 0 
         ]
@@ -267,13 +255,10 @@ def get_configs():
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 32, "use_cumsum": False},
                 num_stages=4, num_warps=4, maxnreg=1024, 
-                # reg_dec_producer=1,
-                # reg_inc_consumer=1
+                reg_dec_producer=1,
+                reg_inc_consumer=1
             )
         ]
-
-
-
 
 @triton.autotune(configs=get_configs(), key=["head_size", "max_seqlen"])
 @triton.jit
@@ -343,8 +328,7 @@ def _forward(
         D_range = tl.arange(0, BLOCK_D)
         D_mask = D_range < head_size
         if not use_cumsum:
-            cm = tl.where(N_range[:, None] >= N_range[None, :], 1.0, 0.0).to(
-                Q_ptr.type.element_ty)
+            cm = tl.where(N_range[:, None] >= N_range[None, :], 1.0, 0.0).to(Q_ptr.type.element_ty)
         else:
             cm = None
 

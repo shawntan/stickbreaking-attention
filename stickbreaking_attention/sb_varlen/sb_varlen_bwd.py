@@ -36,30 +36,30 @@ def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_m
             tl.store(B_ptrs, b, mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
 
     else:
-        # if NO_N_MASK:
-        #     if count == 0:
-        #         tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
-        #     else:
-        #         a += tl.load(A_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-        #         b += tl.load(B_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-        #     tl.store(A_ptrs, a, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-        #     tl.store(B_ptrs, b, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-        # else:
-        mask = N_mask[:, None] & D_mask[None, :]
-        if count == 0:
-            tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
+        if NO_N_MASK:
+            if count == 0:
+                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
+            else:
+                a += tl.load(A_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+                b += tl.load(B_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+            tl.store(A_ptrs, a, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+            tl.store(B_ptrs, b, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
         else:
-            a += tl.load(A_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
-            b += tl.load(B_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
-        tl.store(A_ptrs, a, mask=mask, eviction_policy=EVICTION_POLICY)
-        tl.store(B_ptrs, b, mask=mask, eviction_policy=EVICTION_POLICY)
+            mask = N_mask[:, None] & D_mask[None, :]
+            if count == 0:
+                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
+            else:
+                a += tl.load(A_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
+                b += tl.load(B_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
+            tl.store(A_ptrs, a, mask=mask, eviction_policy=EVICTION_POLICY)
+            tl.store(B_ptrs, b, mask=mask, eviction_policy=EVICTION_POLICY)
 
     # tl.device_print("End locked add.")
     tl.atomic_xchg(Lock_ptr, 0)
 
 @triton.jit
 def _locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr,
-               EVICTION_POLICY: tl.constexpr=""):
+                EVICTION_POLICY: tl.constexpr=""):
     # count = tl.load(Count_ptr, eviction_policy=EVICTION_POLICY)
     if NO_D_MASK:
         if NO_N_MASK:
@@ -98,10 +98,13 @@ def get_configs():
         # for s in [4]
         # for w in [4]]
     else:
+        # num_warps: 4, num_ctas: 1, num_stages: 4, num_buffers_warp_spec: 0, num_consumer_groups: 0,
+        # reg_dec_producer: 8, reg_inc_consumer: 2, maxnreg: 256; 
         return [
             triton.Config(
                 {},
-                num_stages=8, num_warps=4, maxnreg=512, 
+                num_stages=5, num_warps=4,
+                maxnreg=1024, 
                 reg_dec_producer=1,
                 reg_inc_consumer=1
             )
@@ -150,10 +153,12 @@ def _backward(
     fhead_id = tl.program_id(1)
     seq_alloc_prog_id = tl.program_id(2)
     num_seq_alloc_progs = tl.num_programs(2)
+
     if seq_id == 0:
         seq_start_offset = 0
     else:
         seq_start_offset = tl.load(CSL_ptr + seq_id - 1).to(tl.int32)
+
     seq_end_offset = tl.load(CSL_ptr + seq_id).to(tl.int32)
     seq_length = seq_end_offset - seq_start_offset
     num_seq_blocks = tl.cdiv(seq_length, BLOCK_M)
@@ -342,18 +347,16 @@ def _backward_one_row(
             q = tl.load(Q_blk_ptrs)
             do = tl.load(DO_blk_ptrs)
             dr = tl.load(DR_blk_ptrs)
-            neg_log_acc = tl.load(A_blk_ptrs, mask=M_mask)
         else:
             q = tl.load(Q_blk_ptrs, mask=M_mask[:, None])
             do = tl.load(DO_blk_ptrs, mask=M_mask[:, None])
             dr = tl.load(DR_blk_ptrs, mask=M_mask)
-            neg_log_acc = tl.load(A_blk_ptrs, mask=M_mask)
     else:
         MD_mask = M_mask[:, None] & D_mask[None, :]
         q = tl.load(Q_blk_ptrs, mask=MD_mask)
         do = tl.load(DO_blk_ptrs, mask=MD_mask)
         dr = tl.load(DR_blk_ptrs, mask=M_mask)
-        neg_log_acc = tl.load(A_blk_ptrs, mask=M_mask)
+    neg_log_acc = tl.load(A_blk_ptrs, mask=M_mask)
     # --- End band vectors ---
 
     # Init accumulators
@@ -361,11 +364,8 @@ def _backward_one_row(
     grad_prev_acc = tl.zeros((BLOCK_M,), dtype=acc_dtype)
     dq = tl.zeros((BLOCK_M, BLOCK_D), dtype=acc_dtype)
 
-    fwd_cm = tl.trans(cm)
     # always multiple of number of blocks.
     iters = (block_start_offset + BLOCK_M) // BLOCK_N
-    # if (last_N_blk_idxs_end - sequence_start_offset) % BLOCK_N > 0:
-    #     tl.device_print('remainder')
 
     # Iterate only up to start of sequence
     for i in range(iters - (BLOCK_M // BLOCK_N)):
@@ -375,15 +375,12 @@ def _backward_one_row(
             N_mask=None, NO_N_MASK=True,
             D_mask=D_mask, NO_D_MASK=NO_D_MASK,
         )
-
         p, log_om_beta, neg_log_acc = compute_block(
             q, k, qk_scale,
             neg_log_acc,
-            M_blk_idxs, N_blk_idxs,
             cm,
-            on_band=False,
+            block_mask=None,
             ALLOW_TF32=ALLOW_TF32,
-            attend_current=attend_current,
             backward=True,
             is_compiling=is_compiling,
         )
@@ -392,18 +389,16 @@ def _backward_one_row(
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
-
-        p = p.to(do.dtype) 
-        att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
-        cumul_att_dA = tl.dot(att_dA.to(do.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
-        grad_prev_acc += tl.sum(att_dA, axis=1)
+        dqk = p.to(do.dtype)
+        block_dv = tl.dot(tl.trans(dqk), do, allow_tf32=ALLOW_TF32)
+        dqk *= tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None]
+        cumul_att_dA = tl.dot(dqk.to(do.dtype), tl.trans(cm), allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
+        grad_prev_acc += tl.sum(dqk, axis=1)
         neg_beta = tl.exp2(log_om_beta) - 1
-        dqk = att_dA + neg_beta * cumul_att_dA
+        # dqk = dqk + neg_beta * cumul_att_dA
+        dqk += neg_beta * cumul_att_dA
         dqk = dqk.to(k.dtype)
-        dq = tl.dot(dqk, k, acc=dq, allow_tf32=ALLOW_TF32)
         block_dk = tl.dot(tl.trans(dqk), q, allow_tf32=ALLOW_TF32) * logit_scale
-        block_dv = tl.dot(tl.trans(p), do, allow_tf32=ALLOW_TF32)
-
         locked_add(
             KV_Lock_ptr + i, KV_Count_ptr + i,
             DK_blk_ptrs, block_dk,
@@ -411,10 +406,8 @@ def _backward_one_row(
             None, True,
             D_mask, NO_D_MASK,
         )
-
+        dq = tl.dot(dqk, k, acc=dq, allow_tf32=ALLOW_TF32)
         # --- End gradient stuff ---
-        N_blk_idxs += BLOCK_N
-        N_blk_idxs_start += BLOCK_N
         if shared_strides:
             stride_size = BLOCK_N * stride_kn
             K_blk_ptrs += stride_size
@@ -428,6 +421,9 @@ def _backward_one_row(
             DV_blk_ptrs += BLOCK_N * stride_dvn
 
     i = iters - (BLOCK_M // BLOCK_N)
+    N_blk_idxs += i * BLOCK_N
+    N_blk_idxs_start += i * BLOCK_N
+
     for j in range(BLOCK_M // BLOCK_N):
         N_mask = N_blk_idxs < seq_length
         NO_N_MASK = (N_blk_idxs_start + BLOCK_N - 1) < seq_length
@@ -436,46 +432,60 @@ def _backward_one_row(
             K_blk_ptrs,
             V_blk_ptrs,
             N_mask=N_mask,
-            NO_N_MASK=False, # NO_N_MASK,
+            NO_N_MASK=NO_N_MASK, # NO_N_MASK,
             D_mask=D_mask,
             NO_D_MASK=NO_D_MASK,
         )
+        if attend_current:
+            block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
+        else:
+            block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
         p, log_om_beta, neg_log_acc = compute_block(
             q, k, qk_scale,
             neg_log_acc,
-            M_blk_idxs, N_blk_idxs,
             cm,
-            on_band=True,
+            block_mask=block_mask,
             ALLOW_TF32=ALLOW_TF32,
-            attend_current=attend_current,
             backward=True,
             is_compiling=is_compiling,
         )
+
+
+        # p, log_om_beta, neg_log_acc = compute_block(
+        #     q, k, qk_scale,
+        #     neg_log_acc,
+        #     M_blk_idxs, N_blk_idxs,
+        #     cm,
+        #     on_band=True,
+        #     ALLOW_TF32=ALLOW_TF32,
+        #     attend_current=attend_current,
+        #     backward=True,
+        #     is_compiling=is_compiling,
+        # )
 
         if not NO_M_MASK:
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
-        p = p.to(do.dtype) 
-        att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
-        cumul_att_dA = tl.dot(att_dA.to(do.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
-        grad_prev_acc += tl.sum(att_dA, axis=1)
+        dqk = p.to(do.dtype)
+        block_dv = tl.dot(tl.trans(dqk), do, allow_tf32=ALLOW_TF32)
+        dqk *= tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None]
+        cumul_att_dA = tl.dot(dqk.to(do.dtype), tl.trans(cm), allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
+        grad_prev_acc += tl.sum(dqk, axis=1)
         neg_beta = tl.exp2(log_om_beta) - 1
-        dqk = att_dA + neg_beta * cumul_att_dA
+        # dqk = dqk + neg_beta * cumul_att_dA
+        dqk += neg_beta * cumul_att_dA
         dqk = dqk.to(k.dtype)
-
-        dq = tl.dot(dqk, k, acc=dq, allow_tf32=ALLOW_TF32)
         block_dk = tl.dot(tl.trans(dqk), q, allow_tf32=ALLOW_TF32) * logit_scale
-        block_dv = tl.dot(tl.trans(p), do, allow_tf32=ALLOW_TF32)
-
-
         locked_add(
             KV_Lock_ptr + i, KV_Count_ptr + i,
             DK_blk_ptrs, block_dk,
             DV_blk_ptrs, block_dv,
-            N_mask, NO_N_MASK,
+            None, True,
             D_mask, NO_D_MASK,
         )
+        dq = tl.dot(dqk, k, acc=dq, allow_tf32=ALLOW_TF32)
+
 
         # --- End gradient stuff ---
         N_blk_idxs += BLOCK_N
