@@ -5,8 +5,8 @@ import triton.language as tl
 
 PACKAGE_NAME = "stickbreaking_attention"
 log2 = math.log(2)
-inv_log2 = tl.constexpr(1 / log2)
-ALLOW_TF32 = tl.constexpr(True)
+inv_log2: tl.constexpr = 1 / log2
+ALLOW_TF32: tl.constexpr = True
 
 
 

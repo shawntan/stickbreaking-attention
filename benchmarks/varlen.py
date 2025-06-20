@@ -112,8 +112,8 @@ def benchmark_varlen(batch_size, num_heads, head_dim, length, dtype, provider, b
     set_seed(1337)
     lengths = torch.randint(length, length + 1, (batch_size,)).to(device=device, dtype=torch.int32)
     total_length = lengths.sum()
-    warmup = 10
-    rep = 100
+    warmup = 100
+    rep = 1000
 
     q = torch.randn((total_length, num_heads, head_dim), device=device, dtype=dtype)
     k = torch.randn((total_length, num_heads, head_dim), device=device, dtype=dtype)

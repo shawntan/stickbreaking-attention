@@ -11,7 +11,7 @@ from ..utils import custom_op
 
 @triton.jit
 def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr,
-               EVICTION_POLICY: tl.constexpr=tl.constexpr("")):
+               EVICTION_POLICY: tl.constexpr=tl.constexpr("evict_first")):
     while tl.atomic_cas(Lock_ptr, 0, 1) == 1:
         pass
     # tl.device_print("Start locked add.")
@@ -36,23 +36,23 @@ def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_m
             tl.store(B_ptrs, b, mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
 
     else:
-        if NO_N_MASK:
-            if count == 0:
-                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
-            else:
-                a += tl.load(A_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-                b += tl.load(B_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-            tl.store(A_ptrs, a, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-            tl.store(B_ptrs, b, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+        # if NO_N_MASK:
+        #     if count == 0:
+        #         tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
+        #     else:
+        #         a += tl.load(A_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+        #         b += tl.load(B_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+        #     tl.store(A_ptrs, a, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+        #     tl.store(B_ptrs, b, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
+        # else:
+        mask = N_mask[:, None] & D_mask[None, :]
+        if count == 0:
+            tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
         else:
-            mask = N_mask[:, None] & D_mask[None, :]
-            if count == 0:
-                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
-            else:
-                a += tl.load(A_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
-                b += tl.load(B_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
-            tl.store(A_ptrs, a, mask=mask, eviction_policy=EVICTION_POLICY)
-            tl.store(B_ptrs, b, mask=mask, eviction_policy=EVICTION_POLICY)
+            a += tl.load(A_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
+            b += tl.load(B_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
+        tl.store(A_ptrs, a, mask=mask, eviction_policy=EVICTION_POLICY)
+        tl.store(B_ptrs, b, mask=mask, eviction_policy=EVICTION_POLICY)
 
     # tl.device_print("End locked add.")
     tl.atomic_xchg(Lock_ptr, 0)
@@ -74,16 +74,38 @@ def _locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_
         tl.atomic_add(B_ptrs, b, mask=mask)
  
 
+
 def get_configs():
-    return [triton.Config({}, num_stages=s, num_warps=w)
-            # for mb in [64, 128]
-            # for nb in [16, 32, 64]
-            # for s in [8, 7, 6, 5, 4, 3, 2]
-            # for w in [4 , 2]]
+    if False:
+        return [
+            triton.Config(
+                {},
+                num_stages=s, num_warps=w, maxnreg=mnr, 
+                reg_dec_producer=rdp,
+                reg_inc_consumer=ric
+            )
             # for mb in [32]
             # for nb in [32]
-            for s in [4]
-            for w in [4]]
+            for s in [4, 8]
+            for w in [4, 8]
+            for rdp in [1, 2, 4, 8]
+            for ric in [1, 2, 4]
+            for mnr in [256, 512, 1024]
+            # if nb <= mb and mb % nb == 0 
+        ]
+        # for mb in [64]
+        # for nb in [32]
+        # for s in [4]
+        # for w in [4]]
+    else:
+        return [
+            triton.Config(
+                {},
+                num_stages=8, num_warps=4, maxnreg=512, 
+                reg_dec_producer=1,
+                reg_inc_consumer=1
+            )
+        ]
 
 
 
@@ -128,7 +150,6 @@ def _backward(
     fhead_id = tl.program_id(1)
     seq_alloc_prog_id = tl.program_id(2)
     num_seq_alloc_progs = tl.num_programs(2)
-    qk_scale = inv_log2 * logit_scale
     if seq_id == 0:
         seq_start_offset = 0
     else:
@@ -136,6 +157,7 @@ def _backward(
     seq_end_offset = tl.load(CSL_ptr + seq_id).to(tl.int32)
     seq_length = seq_end_offset - seq_start_offset
     num_seq_blocks = tl.cdiv(seq_length, BLOCK_M)
+
     seq_a_block_id = num_seq_blocks - seq_alloc_prog_id - 1
     seq_b_block_id = seq_alloc_prog_id - (num_seq_alloc_progs - num_seq_blocks)
 
@@ -162,6 +184,7 @@ def _backward(
 
     if seq_a_block_id >= 0 or seq_b_block_id >= 0:
         # Universal stuff
+        qk_scale = inv_log2 * logit_scale
         M_range = tl.arange(0, BLOCK_M)
         N_range = tl.arange(0, BLOCK_N)
         D_range = tl.arange(0, BLOCK_D)
@@ -343,14 +366,12 @@ def _backward_one_row(
     iters = (block_start_offset + BLOCK_M) // BLOCK_N
     # if (last_N_blk_idxs_end - sequence_start_offset) % BLOCK_N > 0:
     #     tl.device_print('remainder')
+
     # Iterate only up to start of sequence
     for i in range(iters - (BLOCK_M // BLOCK_N)):
-        N_mask = N_blk_idxs < seq_length
-        NO_N_MASK = (N_blk_idxs_start + BLOCK_N - 1) < seq_length
         # --- Recompute block ---
         k, v = load_kv(
-            K_blk_ptrs,
-            V_blk_ptrs,
+            K_blk_ptrs, V_blk_ptrs,
             N_mask=None, NO_N_MASK=True,
             D_mask=D_mask, NO_D_MASK=NO_D_MASK,
         )
@@ -371,14 +392,17 @@ def _backward_one_row(
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
+
+        p = p.to(do.dtype) 
         att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
-        cumul_att_dA = tl.dot(att_dA.to(cm.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
+        cumul_att_dA = tl.dot(att_dA.to(do.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
         grad_prev_acc += tl.sum(att_dA, axis=1)
-        beta = 1 - tl.exp2(log_om_beta)  # 180 -> 175
-        dqk = att_dA - beta * cumul_att_dA
-        dq = tl.dot(dqk.to(k.dtype), k, acc=dq, allow_tf32=ALLOW_TF32)
-        block_dk = tl.dot(tl.trans(dqk).to(q.dtype), q, allow_tf32=ALLOW_TF32) * logit_scale
-        block_dv = tl.dot(tl.trans(p), do.to(p.dtype), allow_tf32=ALLOW_TF32)
+        neg_beta = tl.exp2(log_om_beta) - 1
+        dqk = att_dA + neg_beta * cumul_att_dA
+        dqk = dqk.to(k.dtype)
+        dq = tl.dot(dqk, k, acc=dq, allow_tf32=ALLOW_TF32)
+        block_dk = tl.dot(tl.trans(dqk), q, allow_tf32=ALLOW_TF32) * logit_scale
+        block_dv = tl.dot(tl.trans(p), do, allow_tf32=ALLOW_TF32)
 
         locked_add(
             KV_Lock_ptr + i, KV_Count_ptr + i,
@@ -432,14 +456,18 @@ def _backward_one_row(
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
+        p = p.to(do.dtype) 
         att_dA = p * (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None])
-        cumul_att_dA = tl.dot(att_dA.to(cm.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
+        cumul_att_dA = tl.dot(att_dA.to(do.dtype), fwd_cm, allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
         grad_prev_acc += tl.sum(att_dA, axis=1)
-        beta = 1 - tl.exp2(log_om_beta)  # 180 -> 175
-        dqk = att_dA - beta * cumul_att_dA
-        dq = tl.dot(dqk.to(k.dtype), k, acc=dq, allow_tf32=ALLOW_TF32)
-        block_dk = tl.dot(tl.trans(dqk).to(q.dtype), q, allow_tf32=ALLOW_TF32) * logit_scale
-        block_dv = tl.dot(tl.trans(p), do.to(p.dtype), allow_tf32=ALLOW_TF32)
+        neg_beta = tl.exp2(log_om_beta) - 1
+        dqk = att_dA + neg_beta * cumul_att_dA
+        dqk = dqk.to(k.dtype)
+
+        dq = tl.dot(dqk, k, acc=dq, allow_tf32=ALLOW_TF32)
+        block_dk = tl.dot(tl.trans(dqk), q, allow_tf32=ALLOW_TF32) * logit_scale
+        block_dv = tl.dot(tl.trans(p), do, allow_tf32=ALLOW_TF32)
+
 
         locked_add(
             KV_Lock_ptr + i, KV_Count_ptr + i,
@@ -465,7 +493,8 @@ def _backward_one_row(
             DV_blk_ptrs += BLOCK_N * stride_dvn
         i += 1
 
-    dq = (logit_scale * dq).to(DQ_head_seq_ptr.type.element_ty)
+    # dq = (logit_scale * dq).to(DQ_head_seq_ptr.type.element_ty)
+    dq *= logit_scale
     if NO_D_MASK:
         tl.store(DQ_blk_ptrs, dq, mask=M_mask[:, None])
     else:
@@ -483,7 +512,7 @@ def varlen_bwd(
     neg_log_acc: torch.Tensor,
     logit_scale,
     attend_current=False,
-    BLOCK_M=64,
+    BLOCK_M=32,
     BLOCK_N=32,
 ):
     batch_size = cu_seqlens.size(0)
@@ -507,8 +536,6 @@ def varlen_bwd(
         cu_seqlens,
         neg_log_acc,
         logit_scale,
-        BLOCK_M,
-        BLOCK_N,
         batch_size,
         num_heads,
         token_size,
@@ -519,7 +546,10 @@ def varlen_bwd(
         num_sequences,
         num_folded_heads,
         num_seq_blocks,
-        attend_current=attend_current
+        attend_current=attend_current,
+        BLOCK_M=32,
+        BLOCK_N=32,
+
     )
     return dq, dk, dv
 
@@ -534,8 +564,6 @@ def _compileable_backward(
     cu_seqlens: torch.Tensor,
     neg_log_acc: torch.Tensor,
     logit_scale: float,
-    BLOCK_M: int,
-    BLOCK_N: int,
     batch_size: int,
     num_heads: int,
     token_size: int,
@@ -549,13 +577,14 @@ def _compileable_backward(
     num_folded_heads: int,
     num_seq_blocks: int,
     attend_current: bool = False,
+    BLOCK_M: int = 32,
+    BLOCK_N: int = 32,
+
 ) -> None:
     BLOCK_D = triton.next_power_of_2(dim_size)
     N_count = num_seq_blocks * (BLOCK_M // BLOCK_N)
-    dkdv_lock = torch.zeros(
-        (num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
-    dkdv_count = torch.zeros(
-        (num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
+    dkdv_lock = torch.zeros((num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
+    dkdv_count = torch.zeros((num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
 
     q_stride = q.stride()
     k_stride = k.stride()
@@ -582,9 +611,6 @@ def _compileable_backward(
         dq_stride = none_stride
         dk_stride = none_stride
         dv_stride = none_stride
-
-
-
 
     _backward[num_sequences, num_folded_heads, num_seq_blocks](
         # DO_ptr, stride_doh, stride_dom, stride_dod,
@@ -626,6 +652,6 @@ def _compileable_backward(
         ALLOW_TF32=ALLOW_TF32,
         inv_log2=inv_log2,
         attend_current=attend_current,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         shared_strides=shared_strides,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
     )
