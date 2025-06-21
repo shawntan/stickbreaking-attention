@@ -161,23 +161,26 @@ def _backward(
     if shared_strides:
         stride_kh = stride_qh
         stride_vh = stride_qh
-        stride_kd = stride_qd
-        stride_vd = stride_qd
-        stride_kn = stride_qm
-        stride_vn = stride_qm
+        stride_doh = stride_qh
         stride_dqh = stride_qh
         stride_dkh = stride_qh
         stride_dvh = stride_qh
+
         stride_dqm = stride_qm
+        stride_kn = stride_qm
+        stride_vn = stride_qm
         stride_dkn = stride_qm
         stride_dvn = stride_qm
-        stride_dqd = stride_qd
-        stride_dkd = stride_qd
-        stride_dvd = stride_qd
-        stride_doh = stride_qh
-        stride_dod = stride_qd
         stride_dom = stride_qm
  
+        stride_kd = None
+        stride_vd = None
+        stride_dqd = None
+        stride_dkd = None
+        stride_dvd = None
+        stride_dod = None 
+
+
 
     if seq_a_block_id >= 0 or seq_b_block_id >= 0:
         # Universal stuff
@@ -309,7 +312,7 @@ def _backward_one_row(
     # Init pointers
     if shared_strides:
         MD_blk_idxs = stride_qm * M_blk_idxs[:, None] + stride_qd * D_range[None, :]
-        ND_blk_idxs = stride_kn * N_blk_idxs[:, None] + stride_kd * D_range[None, :]
+        ND_blk_idxs = stride_kn * N_blk_idxs[:, None] + stride_qd * D_range[None, :]
         # Inputs
         DO_blk_ptrs = DO_head_seq_ptr + MD_blk_idxs
         Q_blk_ptrs = Q_head_seq_ptr + MD_blk_idxs
