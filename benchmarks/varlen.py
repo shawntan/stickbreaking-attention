@@ -97,7 +97,7 @@ providers = [
 @triton.testing.perf_report([
     triton.testing.Benchmark(
         x_names=["length"],
-        x_vals=[4096], # 2 * 4096, 4 * 4096], # , 8 * 4096, 16 * 4096],
+        x_vals=[4096, 2 * 4096, 4 * 4096, 8 * 4096, 16 * 4096],
         line_arg="provider",
         line_vals=[x[0] for x in providers],
         line_names=[x[1] for x in providers],

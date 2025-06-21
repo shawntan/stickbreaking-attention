@@ -475,7 +475,6 @@ def varlen_bwd(
     num_heads, token_size, dim_size = q.size()
     if logit_scale is None:
         logit_scale = 1 / math.sqrt(dim_size)
-    N_count = triton.cdiv(token_size, BLOCK_N)
 
     # dqdkdv = torch.zeros((token_size, num_heads, 3 * dim_size), device=do.device, dtype=do.dtype)
     # dqdkdv = dqdkdv.permute(1, 0, 2)
