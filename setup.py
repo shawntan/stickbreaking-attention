@@ -18,7 +18,7 @@ setup(
     python_requires='>=3.10.10',
     install_requires=[
         'torch',
-        'triton',
+        'triton>=3.3.0',
     ],
     tests_require=['pytest', 'numpy'],
     classifiers=[
