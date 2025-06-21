@@ -16,46 +16,34 @@ def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_m
     while lock_val == 1:
         lock_val = tl.atomic_cas(Lock_ptr, 0, 1)
 
-    # while tl.atomic_cas(Lock_ptr, 0, 1) == 1:
-    #     pass
-    # tl.device_print("Start locked add.")
     count = tl.load(Count_ptr, eviction_policy=EVICTION_POLICY)
-    if NO_D_MASK:
-        if NO_N_MASK:
-            if count == 0:
-                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
-            else:
-                a += tl.load(A_ptrs, eviction_policy=EVICTION_POLICY)
-                b += tl.load(B_ptrs, eviction_policy=EVICTION_POLICY)
+    if NO_D_MASK and NO_N_MASK:
+        if count == 0:
+            tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
             tl.store(A_ptrs, a, eviction_policy=EVICTION_POLICY)
             tl.store(B_ptrs, b, eviction_policy=EVICTION_POLICY)
-
         else:
-            if count == 0:
-                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
-            else:
-                a += tl.load(A_ptrs, mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
-                b += tl.load(B_ptrs, mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
-            tl.store(A_ptrs, a, mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
-            tl.store(B_ptrs, b, mask=N_mask[:, None], eviction_policy=EVICTION_POLICY)
-
+            a += tl.load(A_ptrs, eviction_policy=EVICTION_POLICY)
+            tl.store(A_ptrs, a, eviction_policy=EVICTION_POLICY)
+            b += tl.load(B_ptrs, eviction_policy=EVICTION_POLICY)
+            tl.store(B_ptrs, b, eviction_policy=EVICTION_POLICY)
     else:
-        if NO_N_MASK:
-            if count == 0:
-                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
-            else:
-                a += tl.load(A_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-                b += tl.load(B_ptrs, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-            tl.store(A_ptrs, a, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-            tl.store(B_ptrs, b, mask=D_mask[None, :], eviction_policy=EVICTION_POLICY)
-        else:
+        if N_mask is not None and D_mask is not None:
             mask = N_mask[:, None] & D_mask[None, :]
-            if count == 0:
-                tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
-            else:
-                a += tl.load(A_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
-                b += tl.load(B_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
+        elif D_mask is not None:
+            mask = D_mask[None, :]
+        else:
+            mask = N_mask[:, None]
+
+        if count == 0:
+            tl.store(Count_ptr, 1, eviction_policy=EVICTION_POLICY)
             tl.store(A_ptrs, a, mask=mask, eviction_policy=EVICTION_POLICY)
+            tl.store(B_ptrs, b, mask=mask, eviction_policy=EVICTION_POLICY)
+
+        else:
+            a += tl.load(A_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
+            tl.store(A_ptrs, a, mask=mask, eviction_policy=EVICTION_POLICY)
+            b += tl.load(B_ptrs, mask=mask, eviction_policy=EVICTION_POLICY)
             tl.store(B_ptrs, b, mask=mask, eviction_policy=EVICTION_POLICY)
 
     # tl.device_print("End locked add.")
@@ -80,7 +68,7 @@ def _locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_
 
 
 def get_configs():
-    if False:
+    if True:
         return [
             triton.Config(
                 {},
@@ -90,11 +78,11 @@ def get_configs():
             )
             # for mb in [32]
             # for nb in [32]
-            for s in [4, 8]
-            for w in [4, 8]
-            for rdp in [1, 2, 4, 8]
-            for ric in [1, 2, 4]
-            for mnr in [256, 512, 1024]
+            for s in [9]
+            for w in [4]
+            for rdp in [2]
+            for ric in [16]
+            for mnr in [2048]
             # if nb <= mb and mb % nb == 0 
         ]
         # for mb in [64]
@@ -107,10 +95,10 @@ def get_configs():
         return [
             triton.Config(
                 {},
-                num_stages=8, num_warps=4,
-                # maxnreg=1024, 
-                # reg_dec_producer=1,
-                # reg_inc_consumer=1
+                num_stages=9, num_warps=4,
+                maxnreg=2048, 
+                reg_dec_producer=2,
+                reg_inc_consumer=16
             )
         ]
 
@@ -378,25 +366,14 @@ def _backward_one_row(
         N_mask = N_blk_idxs < seq_length
 
         # --- Recompute block ---
-        if NO_N_MASK:
-            k, v = load_kv(
-                K_blk_ptrs,
-                V_blk_ptrs,
-                N_mask=None,
-                NO_N_MASK=True,
-                D_mask=D_mask,
-                NO_D_MASK=NO_D_MASK,
-            )
-        else:
-            k, v = load_kv(
-                K_blk_ptrs,
-                V_blk_ptrs,
-                N_mask=N_mask,
-                NO_N_MASK=False,
-                D_mask=D_mask,
-                NO_D_MASK=NO_D_MASK,
-            )
-
+        k, v = load_kv(
+            K_blk_ptrs,
+            V_blk_ptrs,
+            N_mask=N_mask,
+            NO_N_MASK=NO_N_MASK,
+            D_mask=D_mask,
+            NO_D_MASK=NO_D_MASK,
+        )
         if attend_current:
             block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
         else:
@@ -634,3 +611,7 @@ def _compileable_backward(
         shared_strides=shared_strides,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
     )
+    del dkdv_lock
+    del dkdv_count
+
+
