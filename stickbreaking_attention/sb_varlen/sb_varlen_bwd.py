@@ -11,7 +11,7 @@ from ..utils import custom_op
 
 @triton.jit
 def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr,
-               EVICTION_POLICY: tl.constexpr=tl.constexpr("evict_first")):
+               EVICTION_POLICY: tl.constexpr=tl.constexpr("")):
     lock_val = 1
     while lock_val == 1:
         lock_val = tl.atomic_cas(Lock_ptr, 0, 1)
@@ -373,65 +373,30 @@ def _backward_one_row(
     on_band_iters: tl.constexpr = BLOCK_M // BLOCK_N
 
     # Iterate only up to start of sequence
-    for i in range(iters - on_band_iters):
-        # --- Recompute block ---
-        k, v = load_kv(
-            K_blk_ptrs, V_blk_ptrs,
-            N_mask=None, NO_N_MASK=True,
-            D_mask=D_mask, NO_D_MASK=NO_D_MASK,
-        )
-        p, log_om_beta, neg_log_acc = compute_block(
-            q, k, qk_scale,
-            neg_log_acc,
-            cm,
-            block_mask=None,
-            ALLOW_TF32=ALLOW_TF32,
-            backward=True,
-            is_compiling=is_compiling,
-        )
-
-        if not NO_M_MASK:
-            neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
-
-        # --- Do gradient stuff ---
-        grad_prev_acc, dq = accumulate_gradients(
-            KV_Lock_ptr + i, KV_Count_ptr + i,
-            DK_blk_ptrs, DV_blk_ptrs,
-            log_om_beta, p, do, dr, q, k, v,
-            grad_prev_acc, dq, cm,
-            None, True,
-            D_mask, NO_D_MASK,   
-            logit_scale, ALLOW_TF32, 
-        )
-        # --- End gradient stuff ---
-        if shared_strides:
-            stride_size = BLOCK_N * stride_kn
-            K_blk_ptrs += stride_size
-            V_blk_ptrs += stride_size
-            DK_blk_ptrs += stride_size
-            DV_blk_ptrs += stride_size
-        else:
-            K_blk_ptrs += BLOCK_N * stride_kn
-            V_blk_ptrs += BLOCK_N * stride_vn
-            DK_blk_ptrs += BLOCK_N * stride_dkn
-            DV_blk_ptrs += BLOCK_N * stride_dvn
-
-    i = iters - on_band_iters 
-    N_blk_idxs += i * BLOCK_N
-    N_blk_idxs_start += i * BLOCK_N
-
-    for j in range(on_band_iters):
-        N_mask = N_blk_idxs < seq_length
+    for i in range(iters):
         NO_N_MASK = (N_blk_idxs_start + BLOCK_N - 1) < seq_length
+        N_mask = N_blk_idxs < seq_length
+
         # --- Recompute block ---
-        k, v = load_kv(
-            K_blk_ptrs,
-            V_blk_ptrs,
-            N_mask=N_mask,
-            NO_N_MASK=NO_N_MASK,
-            D_mask=D_mask,
-            NO_D_MASK=NO_D_MASK,
-        )
+        if NO_N_MASK:
+            k, v = load_kv(
+                K_blk_ptrs,
+                V_blk_ptrs,
+                N_mask=None,
+                NO_N_MASK=True,
+                D_mask=D_mask,
+                NO_D_MASK=NO_D_MASK,
+            )
+        else:
+            k, v = load_kv(
+                K_blk_ptrs,
+                V_blk_ptrs,
+                N_mask=N_mask,
+                NO_N_MASK=False,
+                D_mask=D_mask,
+                NO_D_MASK=NO_D_MASK,
+            )
+
         if attend_current:
             block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
         else:
@@ -449,6 +414,7 @@ def _backward_one_row(
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
         # --- Do gradient stuff ---
+
         grad_prev_acc, dq = accumulate_gradients(
             KV_Lock_ptr + i, KV_Count_ptr + i,
             DK_blk_ptrs, DV_blk_ptrs,
@@ -459,6 +425,7 @@ def _backward_one_row(
             logit_scale, ALLOW_TF32, 
         )
         # --- End gradient stuff ---
+
         N_blk_idxs += BLOCK_N
         N_blk_idxs_start += BLOCK_N
         if shared_strides:
@@ -472,7 +439,6 @@ def _backward_one_row(
             V_blk_ptrs += BLOCK_N * stride_vn
             DK_blk_ptrs += BLOCK_N * stride_dkn
             DV_blk_ptrs += BLOCK_N * stride_dvn
-        i += 1
 
     # dq = (logit_scale * dq).to(DQ_head_seq_ptr.type.element_ty)
     dq *= logit_scale
@@ -526,7 +492,7 @@ def varlen_bwd(
     BLOCK_M=32,
     BLOCK_N=32,
 ):
-    BLOCK_M = 32
+    BLOCK_M = 64
     BLOCK_N = 32
     batch_size = cu_seqlens.size(0)
     num_heads, token_size, dim_size = q.size()
