@@ -251,12 +251,16 @@ def get_configs():
         # for s in [4]
         # for w in [4]]
     else:
+        # BLOCK_M: 64, BLOCK_N: 32,
+        # use_cumsum: False, num_warps: 4, num_ctas: 1, num_stages: 4,
+        # num_buffers_warp_spec: 0, num_consumer_groups: 0,
+        # reg_dec_producer: 2, reg_inc_consumer: 8, maxnreg: 1024;
         return [
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 32, "use_cumsum": False},
                 num_stages=4, num_warps=4, maxnreg=1024, 
-                reg_dec_producer=1,
-                reg_inc_consumer=1
+                reg_dec_producer=2,
+                reg_inc_consumer=8
             )
         ]
 

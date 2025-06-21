@@ -12,8 +12,12 @@ from ..utils import custom_op
 @triton.jit
 def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr,
                EVICTION_POLICY: tl.constexpr=tl.constexpr("evict_first")):
-    while tl.atomic_cas(Lock_ptr, 0, 1) == 1:
-        pass
+    lock_val = 1
+    while lock_val == 1:
+        lock_val = tl.atomic_cas(Lock_ptr, 0, 1)
+
+    # while tl.atomic_cas(Lock_ptr, 0, 1) == 1:
+    #     pass
     # tl.device_print("Start locked add.")
     count = tl.load(Count_ptr, eviction_policy=EVICTION_POLICY)
     if NO_D_MASK:
@@ -103,10 +107,10 @@ def get_configs():
         return [
             triton.Config(
                 {},
-                num_stages=5, num_warps=4,
-                maxnreg=1024, 
-                reg_dec_producer=1,
-                reg_inc_consumer=1
+                num_stages=8, num_warps=4,
+                # maxnreg=1024, 
+                # reg_dec_producer=1,
+                # reg_inc_consumer=1
             )
         ]
 
@@ -366,9 +370,10 @@ def _backward_one_row(
 
     # always multiple of number of blocks.
     iters = (block_start_offset + BLOCK_M) // BLOCK_N
+    on_band_iters: tl.constexpr = BLOCK_M // BLOCK_N
 
     # Iterate only up to start of sequence
-    for i in range(iters - (BLOCK_M // BLOCK_N)):
+    for i in range(iters - on_band_iters):
         # --- Recompute block ---
         k, v = load_kv(
             K_blk_ptrs, V_blk_ptrs,
@@ -394,6 +399,7 @@ def _backward_one_row(
             DK_blk_ptrs, DV_blk_ptrs,
             log_om_beta, p, do, dr, q, k, v,
             grad_prev_acc, dq, cm,
+            None, True,
             D_mask, NO_D_MASK,   
             logit_scale, ALLOW_TF32, 
         )
@@ -410,11 +416,11 @@ def _backward_one_row(
             DK_blk_ptrs += BLOCK_N * stride_dkn
             DV_blk_ptrs += BLOCK_N * stride_dvn
 
-    i = iters - (BLOCK_M // BLOCK_N)
+    i = iters - on_band_iters 
     N_blk_idxs += i * BLOCK_N
     N_blk_idxs_start += i * BLOCK_N
 
-    for j in range(BLOCK_M // BLOCK_N):
+    for j in range(on_band_iters):
         N_mask = N_blk_idxs < seq_length
         NO_N_MASK = (N_blk_idxs_start + BLOCK_N - 1) < seq_length
         # --- Recompute block ---
@@ -422,7 +428,7 @@ def _backward_one_row(
             K_blk_ptrs,
             V_blk_ptrs,
             N_mask=N_mask,
-            NO_N_MASK=NO_N_MASK, # NO_N_MASK,
+            NO_N_MASK=NO_N_MASK,
             D_mask=D_mask,
             NO_D_MASK=NO_D_MASK,
         )
@@ -439,20 +445,6 @@ def _backward_one_row(
             backward=True,
             is_compiling=is_compiling,
         )
-
-
-        # p, log_om_beta, neg_log_acc = compute_block(
-        #     q, k, qk_scale,
-        #     neg_log_acc,
-        #     M_blk_idxs, N_blk_idxs,
-        #     cm,
-        #     on_band=True,
-        #     ALLOW_TF32=ALLOW_TF32,
-        #     attend_current=attend_current,
-        #     backward=True,
-        #     is_compiling=is_compiling,
-        # )
-
         if not NO_M_MASK:
             neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
 
@@ -462,6 +454,7 @@ def _backward_one_row(
             DK_blk_ptrs, DV_blk_ptrs,
             log_om_beta, p, do, dr, q, k, v,
             grad_prev_acc, dq, cm,
+            N_mask, NO_N_MASK,
             D_mask, NO_D_MASK,   
             logit_scale, ALLOW_TF32, 
         )
@@ -493,13 +486,14 @@ def accumulate_gradients(
     KV_Lock_ptr, KV_Count_ptr, DK_blk_ptrs, DV_blk_ptrs,
     log_om_beta, p, do, dr, q, k, v,
     grad_prev_acc, dq, cm,
-    D_mask, NO_D_MASK,   
+    N_mask, NO_N_MASK,
+    D_mask, NO_D_MASK,
     logit_scale, ALLOW_TF32, 
 ):
     dqk = p.to(do.dtype)
     block_dv = tl.dot(tl.trans(dqk), do, allow_tf32=ALLOW_TF32)
-    dqk *= tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None]
-    cumul_att_dA = tl.dot(dqk.to(do.dtype), tl.trans(cm), allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
+    dqk *= (tl.dot(do, tl.trans(v), allow_tf32=ALLOW_TF32) - dr[:, None]).to(do.dtype)
+    cumul_att_dA = tl.dot(dqk, tl.trans(cm), allow_tf32=ALLOW_TF32) + grad_prev_acc[:, None]
     grad_prev_acc += tl.sum(dqk, axis=1)
     neg_beta = tl.exp2(log_om_beta) - 1
         # dqk = dqk + neg_beta * cumul_att_dA
@@ -507,14 +501,15 @@ def accumulate_gradients(
     dqk = dqk.to(k.dtype)
     block_dk = tl.dot(tl.trans(dqk), q, allow_tf32=ALLOW_TF32) * logit_scale
     locked_add(
-            KV_Lock_ptr, KV_Count_ptr,
-            DK_blk_ptrs, block_dk,
-            DV_blk_ptrs, block_dv,
-            None, True,
-            D_mask, NO_D_MASK,
-        )
+        KV_Lock_ptr, KV_Count_ptr,
+        DK_blk_ptrs, block_dk,
+        DV_blk_ptrs, block_dv,
+        N_mask, NO_N_MASK,
+        D_mask, NO_D_MASK,
+    )
     dq = tl.dot(dqk, k, acc=dq, allow_tf32=ALLOW_TF32)
-    return grad_prev_acc,dq
+
+    return grad_prev_acc, dq
 
 
 def varlen_bwd(
@@ -531,6 +526,8 @@ def varlen_bwd(
     BLOCK_M=32,
     BLOCK_N=32,
 ):
+    BLOCK_M = 32
+    BLOCK_N = 32
     batch_size = cu_seqlens.size(0)
     num_heads, token_size, dim_size = q.size()
     if logit_scale is None:
@@ -563,8 +560,8 @@ def varlen_bwd(
         num_folded_heads,
         num_seq_blocks,
         attend_current=attend_current,
-        BLOCK_M=32,
-        BLOCK_N=32,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
 
     )
     return dq, dk, dv
