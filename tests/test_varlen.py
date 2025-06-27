@@ -56,6 +56,7 @@ def assert_close(varname, a, b, eps):
         # print((diff.sum(0).median(dim=0)[0] > eps).int())
         err_locs = (diff > eps).max(dim=-1)[0].int()
         print(err_locs)
+        print(torch.sum(1 - err_locs))
         # print(diff)
         assert max_diff < eps, max_diff
 
@@ -79,16 +80,13 @@ class TestClass:
         torch.set_printoptions(threshold=2 * 8192, linewidth=110, edgeitems=30)
         device = torch.device('cuda:0')
         lengths = torch.randint(length, length + 1, (batch_size,)).to(device=device, dtype=torch.int32)
-        print(lengths)
         total_length = lengths.sum()
         cu_seqlens = torch.cumsum(lengths, dim=-1)
-        v = 0.25 * torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) 
-        #     + 1.# 0.001 * torch.arange(total_length, device=device, dtype=torch.float32)[None, :, None]
         q = 0.25 * (torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) + 1)
-        #  * 0. + 5.
-        k = 0.25 * (torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) - 1)
-        #  * 0. + 5.
+        k = 0.25 * (torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) - 1) 
+        v = 0.25 * torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) 
         print(q.max(), k.max(), v.max())
+
         q = q.to(dtype)
         k = k.to(dtype)
         v = v.to(dtype)
@@ -110,11 +108,6 @@ class TestClass:
         assert_close("o", ref_out, o, eps)
         if not forward_only:
             dq, dk, dv = torch.autograd.grad(o, inputs=(q, k, v), grad_outputs=do)
-            print("Triton output:")
-            print(dv[0, :, 0])
-            print("Reference output:")
-            print(ref_dv[0, :, 0])
-
             assert_close("dq", ref_dq, dq, eps)
             assert_close("dk", ref_dk, dk, eps)
             assert_close("dv", ref_dv, dv, eps)

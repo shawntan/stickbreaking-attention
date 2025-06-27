@@ -10,7 +10,7 @@ import sys
 
 FWD_BLOCK_M: tl.constexpr = 64
 FWD_BLOCK_N: tl.constexpr = 32
-BWD_BLOCK_M: tl.constexpr = 32
+BWD_BLOCK_M: tl.constexpr = 64
 BWD_BLOCK_N: tl.constexpr = 32
 
 
@@ -56,47 +56,48 @@ class StickBreakingAttention(torch.autograd.Function):
             q, k, v, neg_log_acc, cu_seqlens = ctx.saved_tensors
             do = do.contiguous()
             drem = drem.contiguous()
-            for i in range(5):
-                dq, dk, dv = varlen_bwd(
-                    do, drem,
-                    q, k, v,
-                    cu_seqlens,
-                    max_seqlens,
-                    neg_log_acc,
-                    logit_scale,
-                    attend_current=attend_current,
-                    BLOCK_M=BWD_BLOCK_M,
-                    BLOCK_N=BWD_BLOCK_N,
-                )
-                if (torch.isnan(dq).any() or
-                    torch.isnan(dk).any() or
-                    torch.isnan(dv).any()):
-                    print(torch.distributed.get_rank(), file=sys.stderr, flush=True)
-                    continue
-                else:
-                    break
+            dq, dk, dv = varlen_bwd(
+                do, drem,
+                q, k, v,
+                cu_seqlens,
+                max_seqlens,
+                neg_log_acc,
+                logit_scale,
+                attend_current=attend_current,
+                BLOCK_M=BWD_BLOCK_M,
+                BLOCK_N=BWD_BLOCK_N,
+            )
 
-            if (torch.isnan(dq).any() or
-                torch.isnan(dk).any() or
-                torch.isnan(dv).any()):
-                rank = torch.distributed.get_rank()
-                filename = f"bwd-rank{rank}.pt"
-                torch.save({
-                    "do": do,
-                    "drem": drem,
-                    "q": q,
-                    "k": k,
-                    "v": v,
-                    "cu_seqlens": cu_seqlens,
-                    "max_seqlens": max_seqlens,
-                    "neg_log_acc": neg_log_acc,
-                    "logit_scale": logit_scale,
-                    "attend_current": attend_current,
-                    "BLOCK_M": BWD_BLOCK_M,
-                    "BLOCK_N": BWD_BLOCK_N,
-                    'out': (dq, dk, dv)
-                }, open(filename, 'wb'))
-                exit()
+            # for i in range(5):
+            #     if (torch.isnan(dq).any() or
+            #         torch.isnan(dk).any() or
+            #         torch.isnan(dv).any()):
+            #         # print(torch.distributed.get_rank(), file=sys.stderr, flush=True)
+            #         continue
+            #     else:
+            #         break
+
+            # if (torch.isnan(dq).any() or
+            #     torch.isnan(dk).any() or
+            #     torch.isnan(dv).any()):
+            #     rank = torch.distributed.get_rank()
+            #     filename = f"bwd-rank{rank}.pt"
+            #     torch.save({
+            #         "do": do,
+            #         "drem": drem,
+            #         "q": q,
+            #         "k": k,
+            #         "v": v,
+            #         "cu_seqlens": cu_seqlens,
+            #         "max_seqlens": max_seqlens,
+            #         "neg_log_acc": neg_log_acc,
+            #         "logit_scale": logit_scale,
+            #         "attend_current": attend_current,
+            #         "BLOCK_M": BWD_BLOCK_M,
+            #         "BLOCK_N": BWD_BLOCK_N,
+            #         'out': (dq, dk, dv)
+            #     }, open(filename, 'wb'))
+            #     exit()
 
             return dq, dk, dv, None, None, None, None
 
