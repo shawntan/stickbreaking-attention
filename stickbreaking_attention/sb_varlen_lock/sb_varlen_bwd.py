@@ -8,6 +8,7 @@ from ..utils import ALLOW_TF32, inv_log2
 from .sb_varlen_fwd import compute_block, load_kv
 
 from ..utils import custom_op
+from torch.library import triton_op, wrap_triton
 
 @triton.jit
 def locked_add(Lock_ptr, Count_ptr, A_ptrs, a, B_ptrs, b, N_mask, NO_N_MASK, D_mask, NO_D_MASK: tl.constexpr,
@@ -121,7 +122,6 @@ def _backward(
     DK_ptr, stride_dkh: tl.constexpr, stride_dkn: tl.constexpr, stride_dkd: tl.constexpr,
     DV_ptr, stride_dvh: tl.constexpr, stride_dvn: tl.constexpr, stride_dvd: tl.constexpr,
     KV_Lock_ptr, KV_Count_ptr, stride_kvs: tl.constexpr, stride_kvh: tl.constexpr,
-    GAI_ptr, stride_gaib, stride_gaih,
     CSL_ptr,
     logit_scale: tl.constexpr,
     batch_size: tl.constexpr,
@@ -206,7 +206,6 @@ def _backward(
             DV_head_seq_ptr = DV_ptr + stride_dvh * head_id + stride_dvn * seq_start_offset
             KV_Lock_head_seq_ptr = KV_Lock_ptr + stride_kvs * seq_id + stride_kvh * head_id
             KV_Count_head_seq_ptr = KV_Count_ptr + stride_kvs * seq_id + stride_kvh * head_id
-            GAI_head_seq_ptr = GAI_ptr + stride_gaib * seq_id + stride_gaih * head_id
 
             _backward_one_row(
                 seq_a_block_id, seq_length, qk_scale,
@@ -223,7 +222,6 @@ def _backward(
                 DV_head_seq_ptr, stride_dvn, stride_dvd,
                 KV_Lock_head_seq_ptr,
                 KV_Count_head_seq_ptr,
-                GAI_head_seq_ptr,
                 logit_scale,
                 BLOCK_D,
                 NO_D_MASK,
@@ -248,7 +246,6 @@ def _backward(
             DV_head_seq_ptr = DV_ptr + stride_dvh * head_id + stride_dvn * seq_start_offset
             KV_Lock_head_seq_ptr = KV_Lock_ptr + stride_kvs * seq_id + stride_kvh * head_id
             KV_Count_head_seq_ptr = KV_Count_ptr +  stride_kvs * seq_id + stride_kvh * head_id
-            GAI_head_seq_ptr = GAI_ptr + stride_gaib * seq_id + stride_gaih * head_id
             _backward_one_row(
                 seq_b_block_id, seq_length, qk_scale,
                 M_range, N_range, D_range, D_mask,
@@ -264,7 +261,6 @@ def _backward(
                 DV_head_seq_ptr, stride_dvn, stride_dvd,
                 KV_Lock_head_seq_ptr,
                 KV_Count_head_seq_ptr,
-                GAI_head_seq_ptr,
                 logit_scale,
                 BLOCK_D,
                 NO_D_MASK,
@@ -293,7 +289,6 @@ def _backward_one_row(
     DK_head_seq_ptr, stride_dkn: tl.constexpr, stride_dkd: tl.constexpr,
     DV_head_seq_ptr, stride_dvn: tl.constexpr, stride_dvd: tl.constexpr,
     KV_Lock_ptr, KV_Count_ptr,
-    GAI_head_seq_ptr,
     logit_scale: tl.constexpr,
     BLOCK_D: tl.constexpr,
     NO_D_MASK: tl.constexpr,
@@ -494,20 +489,24 @@ def varlen_bwd(
     if logit_scale is None:
         logit_scale = 1 / math.sqrt(dim_size)
 
-    # dqdkdv = torch.zeros((token_size, num_heads, 3 * dim_size), device=do.device, dtype=do.dtype)
-    # dqdkdv = dqdkdv.permute(1, 0, 2)
-    # dq, dk, dv = dqdkdv.chunk(3, dim=-1)
-    dq = torch.zeros_like(q)
-    dk = torch.zeros_like(k)
-    dv = torch.zeros_like(v)
-
     num_sequences = batch_size
     num_folded_heads = triton.cdiv(num_heads, 2)
     num_seq_blocks = triton.cdiv(max_seqlens, BLOCK_M) + 1
+
+    N_count = num_seq_blocks * (BLOCK_M // BLOCK_N)
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+    dkdv_lock = torch.zeros((num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
+    dkdv_count = torch.zeros((num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
+
+
     _compileable_backward(
         do, dr, q, k, v,
         cu_seqlens,
         neg_log_acc,
+        dkdv_lock,
+        dkdv_count,
         logit_scale,
         batch_size,
         num_heads,
@@ -527,7 +526,8 @@ def varlen_bwd(
     return dq, dk, dv
 
 
-@custom_op("varlen_bwd", mutates_args={"dq", "dk", "dv"})
+# @custom_op("varlen_bwd", mutates_args={"dq", "dk", "dv"})
+@triton_op("sb_attn::varlen_bwd", mutates_args={"dq", "dk", "dv", "dkdv_lock", "dkdv_count"})
 def _compileable_backward(
     do: torch.Tensor,
     dr: torch.Tensor,
@@ -536,6 +536,8 @@ def _compileable_backward(
     v: torch.Tensor,
     cu_seqlens: torch.Tensor,
     neg_log_acc: torch.Tensor,
+    dkdv_lock: torch.Tensor,
+    dkdv_count: torch.Tensor,
     logit_scale: float,
     batch_size: int,
     num_heads: int,
@@ -555,18 +557,6 @@ def _compileable_backward(
 
 ) -> None:
     BLOCK_D = triton.next_power_of_2(dim_size)
-    N_count = num_seq_blocks * (BLOCK_M // BLOCK_N)
-    dkdv_lock = torch.zeros((num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
-    dkdv_count = torch.zeros((num_sequences, num_heads, N_count), dtype=torch.int32, device=q.device)
-
-
-    block_count = N_count - 1
-    grad_acc_intermediates = torch.zeros((
-        num_sequences,
-        num_heads,
-        (block_count * (block_count + 1)) // 2,
-        BLOCK_M
-    ), dtype=torch.int32, device=q.device)
 
     q_stride = q.stride()
     k_stride = k.stride()
@@ -593,7 +583,7 @@ def _compileable_backward(
         dk_stride = none_stride
         dv_stride = none_stride
 
-    _backward[num_sequences, num_folded_heads, num_seq_blocks](
+    wrap_triton(_backward)[num_sequences, num_folded_heads, num_seq_blocks](
         # DO_ptr, stride_doh, stride_dom, stride_dod,
         do, do_stride[0], do_stride[1], do_stride[2],
         # DR_ptr, stride_drh, stride_drm,
@@ -617,9 +607,6 @@ def _compileable_backward(
         dkdv_count,
         dkdv_lock.stride(0),
         dkdv_lock.stride(1),
-        grad_acc_intermediates, 
-        grad_acc_intermediates.stride(0),
-        grad_acc_intermediates.stride(1),
         cu_seqlens,
         logit_scale=logit_scale,
         batch_size=batch_size,
