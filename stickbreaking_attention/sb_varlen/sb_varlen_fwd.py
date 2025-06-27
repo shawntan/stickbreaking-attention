@@ -80,6 +80,7 @@ def _forward_one_row(
     O_head_seq_ptr, stride_om: tl.constexpr, stride_od: tl.constexpr,
     R_head_seq_ptr, stride_rm: tl.constexpr,
     A_head_seq_ptr, stride_am: tl.constexpr,
+    NLI_head_seq_ptr, stride_nli_grid: tl.constexpr,
     W_head_seq_ptr, stride_wm: tl.constexpr, stride_wn: tl.constexpr,
     BLOCK_D: tl.constexpr,
     NO_D_MASK: tl.constexpr,
@@ -142,12 +143,14 @@ def _forward_one_row(
     # Iterate only up to start of sequence
 
     # On Band
+    col_id = iters
     for i in range(on_band_iters):
         N_blk_idxs -= BLOCK_N
         N_blk_idxs_start -= BLOCK_N
         K_blk_ptrs -= BLOCK_N * stride_kn
         V_blk_ptrs -= BLOCK_N * stride_vn
         N_mask = N_blk_idxs < seq_length
+        col_id -= 1
 
         k, v = load_kv(
             K_blk_ptrs,
@@ -162,6 +165,14 @@ def _forward_one_row(
             block_mask = M_blk_idxs[:, None] >= N_blk_idxs[None, :]
         else:
             block_mask = M_blk_idxs[:, None] > N_blk_idxs[None, :]
+        
+        tl.store(
+            (NLI_head_seq_ptr + 
+             stride_nli_grid * ((((seq_block_id + 1) * seq_block_id) // 2) * (BLOCK_M // BLOCK_N) + col_id) +
+             M_range),
+            neg_log_acc
+        )
+
         p, _, neg_log_acc = compute_block(
             q, k, qk_scale,
             neg_log_acc,
@@ -187,6 +198,13 @@ def _forward_one_row(
             K_blk_ptrs, V_blk_ptrs,
             N_mask=None, NO_N_MASK=True,
             D_mask=D_mask, NO_D_MASK=NO_D_MASK,
+        )
+        col_id -= 1
+        tl.store(
+            (NLI_head_seq_ptr + 
+             stride_nli_grid * ((((seq_block_id + 1) * seq_block_id) // 2) * (BLOCK_M // BLOCK_N) + col_id) +
+             M_range),
+            neg_log_acc
         )
         p, _, neg_log_acc = compute_block(
             q, k, qk_scale,
@@ -259,8 +277,8 @@ def get_configs():
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 32, "use_cumsum": False},
                 num_stages=4, num_warps=4, maxnreg=1024, 
-                reg_dec_producer=2,
-                reg_inc_consumer=8
+                # reg_dec_producer=2,
+                # reg_inc_consumer=8
             )
         ]
 
@@ -273,6 +291,7 @@ def _forward(
     O_ptr, stride_oh: tl.constexpr, stride_om: tl.constexpr, stride_od: tl.constexpr,
     R_ptr, stride_rh: tl.constexpr, stride_rm: tl.constexpr,
     A_ptr, stride_ah: tl.constexpr, stride_am: tl.constexpr,
+    NLI_ptr, stride_nlib: tl.constexpr, stride_nlih: tl.constexpr, stride_nli_grid: tl.constexpr,
     W_ptr, stride_wh: tl.constexpr, stride_wm: tl.constexpr, stride_wn: tl.constexpr,
     CSL_ptr, logit_scale: tl.constexpr,
     batch_size: tl.constexpr,
@@ -346,6 +365,8 @@ def _forward(
             R_head_seq_ptr = R_ptr + stride_rh * head_id + stride_rm * seq_start_offset
             A_head_seq_ptr = A_ptr + stride_ah * head_id + stride_am * seq_start_offset
             W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_am * seq_start_offset
+            NLI_head_seq_ptr = NLI_ptr + stride_nlib * seq_id + stride_nlih * head_id
+
             _forward_one_row(
                 seq_a_block_id,
                 seq_length,
@@ -361,6 +382,7 @@ def _forward(
                 O_head_seq_ptr, stride_om, stride_od,
                 R_head_seq_ptr, stride_rm,
                 A_head_seq_ptr, stride_am,
+                NLI_head_seq_ptr, stride_nli_grid,
                 W_head_seq_ptr, stride_wm, stride_wn,
                 BLOCK_D,
                 NO_D_MASK,
@@ -386,6 +408,8 @@ def _forward(
             R_head_seq_ptr = R_ptr + stride_rh * head_id + stride_rm * seq_start_offset
             A_head_seq_ptr = A_ptr + stride_ah * head_id + stride_am * seq_start_offset
             W_head_seq_ptr = W_ptr + stride_wh * head_id + stride_am * seq_start_offset
+            NLI_head_seq_ptr = NLI_ptr + stride_nlib * seq_id + stride_nlih * head_id
+
             _forward_one_row(
                 seq_b_block_id,
                 seq_length,
@@ -401,6 +425,7 @@ def _forward(
                 O_head_seq_ptr, stride_om, stride_od,
                 R_head_seq_ptr, stride_rm,
                 A_head_seq_ptr, stride_am,
+                NLI_head_seq_ptr, stride_nli_grid,
                 W_head_seq_ptr, stride_wm, stride_wn,
                 BLOCK_D,
                 NO_D_MASK,
@@ -434,10 +459,18 @@ def varlen_fwd(
     else:
         W = torch.empty((1, 1, 1), device=q.device)
 
+    block_count = triton.cdiv(max_seqlens, BLOCK_M)
+    neg_log_intermediates = torch.zeros((
+        batch_size,
+        num_heads,
+        (block_count * (block_count + 1)) // 2 * (BLOCK_M // BLOCK_N),
+        BLOCK_M
+    ), dtype=q.dtype, device=q.device)
+
+
+
     _compileable_forward(
-        q,
-        k,
-        v,
+        q, k, v,
         cu_seqlens,
         max_seqlens,
         logit_scale,
@@ -452,13 +485,14 @@ def varlen_fwd(
         o,
         rem,
         neg_log_acc,
+        neg_log_intermediates,
         W,
         attend_current=attend_current
     )
     if return_attention:
-        return o, rem, neg_log_acc, W
+        return o, rem, neg_log_acc, neg_log_intermediates, W
     else:
-        return o, rem, neg_log_acc
+        return o, rem, neg_log_acc, neg_log_intermediates
 
 
 @custom_op("varlen_fwd", mutates_args={"o", "rem", "neg_log_acc", "W"})
@@ -480,6 +514,7 @@ def _compileable_forward(
     o: torch.Tensor,
     rem: torch.Tensor,
     neg_log_acc: torch.Tensor,
+    neg_log_intermediates: torch.Tensor,
     W: torch.Tensor,
     attend_current: bool,
 ) -> None:
@@ -512,6 +547,10 @@ def _compileable_forward(
         neg_log_acc,
         neg_log_acc.stride(0),
         neg_log_acc.stride(1),
+        neg_log_intermediates,
+        neg_log_intermediates.stride(0),
+        neg_log_intermediates.stride(1),
+        neg_log_intermediates.stride(2),
         W,
         W.stride(0),
         W.stride(1),

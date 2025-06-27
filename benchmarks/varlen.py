@@ -2,7 +2,7 @@ import torch
 import pytest
 import math
 from torch.nn import functional as F
-from stickbreaking_attention.sb_varlen import sb_attn_varlen
+from stickbreaking_attention import sb_attn_varlen
 from stickbreaking_attention.sb_varlen_old import sb_attn_varlen as sb_attn_varlen_old
 import triton
 from flash_attn import flash_attn_varlen_func

@@ -2,7 +2,7 @@ import torch
 import pytest
 import math
 from torch.nn import functional as F
-from stickbreaking_attention.sb_varlen import sb_attn_varlen
+from stickbreaking_attention import sb_attn_varlen
 from transformers import set_seed
 from stickbreaking_attention.sb_ref import stickbreaking
 
@@ -22,7 +22,7 @@ def ref_fwd(q, k, v, lengths, attend_current=False):
             mask[:len, :len], cm[:len, :len]
         )
 
-        o = o + rem[..., None] * v_chunk[None]
+        # o = o + rem[..., None] * v_chunk[None]
         outputs.append(o[0])
     return torch.cat(outputs, 1)
 
@@ -66,7 +66,7 @@ class TestClass:
     @pytest.mark.parametrize('batch_size', [4, 2, 1])
     @pytest.mark.parametrize('num_heads', [12, 24, 8, 4, 2, 1, 7])
     @pytest.mark.parametrize('head_dim', [128, 64, 32, 16, 50])
-    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 64, 500])
+    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 256, 128, 64, 500])
     # @pytest.mark.parametrize('batch_size', [1])
     # @pytest.mark.parametrize('num_heads', [12, 3])
     # @pytest.mark.parametrize('head_dim', [128])
@@ -76,15 +76,18 @@ class TestClass:
     @pytest.mark.parametrize('attend_current', [False, True])
     def test_varlen(self, batch_size, num_heads, head_dim, length, attend_current, dtype, forward_only):
         set_seed(1337)
-        torch.set_printoptions(linewidth=110, edgeitems=30)
+        torch.set_printoptions(threshold=2 * 8192, linewidth=110, edgeitems=30)
         device = torch.device('cuda:0')
         lengths = torch.randint(length, length + 1, (batch_size,)).to(device=device, dtype=torch.int32)
         print(lengths)
         total_length = lengths.sum()
         cu_seqlens = torch.cumsum(lengths, dim=-1)
-        v = 0.25 * torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32)
-        q = 0.25 * (torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) + 1) 
+        v = 0.25 * torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) 
+        #     + 1.# 0.001 * torch.arange(total_length, device=device, dtype=torch.float32)[None, :, None]
+        q = 0.25 * (torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) + 1)
+        #  * 0. + 5.
         k = 0.25 * (torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) - 1)
+        #  * 0. + 5.
         print(q.max(), k.max(), v.max())
         q = q.to(dtype)
         k = k.to(dtype)
@@ -92,7 +95,8 @@ class TestClass:
         q.requires_grad_()
         k.requires_grad_()
         v.requires_grad_()
-        do = torch.randn((num_heads, total_length, head_dim), device=device, dtype=dtype)
+        do = torch.randn((num_heads, total_length, head_dim), device=device, dtype=dtype) # * 0. \
+        #     + 0.001 * torch.arange(total_length, device=device, dtype=torch.float32)[None, :, None]
         with torch.cuda.device(device):
             o, rem = sb_attn_varlen(q, k, v,
                                     cu_seqlens=cu_seqlens,
@@ -100,13 +104,17 @@ class TestClass:
                                     inv_temp=1 / math.sqrt(q.size(-1)),
                                     zero_start=False,
                                     attend_current=attend_current)
-            o = o + rem[..., None] * v
+            # o = o + rem[..., None] * v
             ref_out, ref_dq, ref_dk, ref_dv = ref_bwd(do, q, k, v, lengths, attend_current=attend_current)
         eps = 0.05
-        torch.cuda.synchronize()
         assert_close("o", ref_out, o, eps)
         if not forward_only:
             dq, dk, dv = torch.autograd.grad(o, inputs=(q, k, v), grad_outputs=do)
+            print("Triton output:")
+            print(dv[0, :, 0])
+            print("Reference output:")
+            print(ref_dv[0, :, 0])
+
+            assert_close("dq", ref_dq, dq, eps)
             assert_close("dk", ref_dk, dk, eps)
             assert_close("dv", ref_dv, dv, eps)
-            assert_close("dq", ref_dq, dq, eps)

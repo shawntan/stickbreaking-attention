@@ -9,7 +9,7 @@ from torch.nn import functional as F
 
 FWD_BLOCK_M: tl.constexpr = 64
 FWD_BLOCK_N: tl.constexpr = 32
-BWD_BLOCK_M: tl.constexpr = 32
+BWD_BLOCK_M: tl.constexpr = 64
 BWD_BLOCK_N: tl.constexpr = 32
 
 
@@ -27,10 +27,8 @@ class StickBreakingAttention(torch.autograd.Function):
     def forward(ctx, q, k, v, cu_seqlens, max_seqlens, inv_temp, attend_current):
         no_grad = not ctx.needs_input_grad[0]
         logit_scale = inv_temp
-        o, rem, neg_log_acc = varlen_fwd(
-            q,
-            k,
-            v,
+        o, rem, neg_log_acc, neg_log_intermediates = varlen_fwd(
+            q, k, v,
             cu_seqlens,
             max_seqlens,
             logit_scale=inv_temp,
@@ -39,7 +37,7 @@ class StickBreakingAttention(torch.autograd.Function):
             BLOCK_M=FWD_BLOCK_M,
             BLOCK_N=FWD_BLOCK_N,
         )
-        ctx.save_for_backward(q, k, v, neg_log_acc, cu_seqlens)
+        ctx.save_for_backward(q, k, v, neg_log_acc, neg_log_intermediates, cu_seqlens)
         ctx.logit_scale = logit_scale
         ctx.max_seqlens = max_seqlens
         ctx.attend_current = attend_current
@@ -50,13 +48,14 @@ class StickBreakingAttention(torch.autograd.Function):
         logit_scale = ctx.logit_scale
         max_seqlens = ctx.max_seqlens
         attend_current = ctx.attend_current
-        q, k, v, neg_log_acc, cu_seqlens = ctx.saved_tensors
+        q, k, v, neg_log_acc, neg_log_intermediates, cu_seqlens = ctx.saved_tensors
         dq, dk, dv = varlen_bwd(
             do, drem,
             q, k, v,
             cu_seqlens,
             max_seqlens,
             neg_log_acc,
+            neg_log_intermediates,
             logit_scale,
             attend_current=attend_current,
             BLOCK_M=BWD_BLOCK_M,
