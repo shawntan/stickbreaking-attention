@@ -33,7 +33,9 @@ def ref_fwd(q, k, v, lengths):
 
         # o = o + rem[..., None] * v_chunk[None]
         outputs.append(o[0])
-    return torch.cat(outputs, 1)
+    o = torch.cat(outputs, 1)
+    o = o.permute(1, 0, 2)
+    return o
 
 def ref_fwdbwd(do, q, k, v, lengths):
     o = ref_fwd(q, k, v, lengths)
@@ -51,6 +53,7 @@ def tri_fwdbwd(do, q, k, v, lengths):
                             inv_temp=1 / math.sqrt(q.size(-1)),
                             zero_start=False)
     # o = o + rem[..., None] * v
+    o = o.permute(1, 0, 2)
     return o
 
 def old_tri_fwdbwd(do, q, k, v, lengths):
@@ -64,6 +67,7 @@ def old_tri_fwdbwd(do, q, k, v, lengths):
                             inv_temp=1 / math.sqrt(q.size(-1)),
                             zero_start=False)
     # o = o + rem[..., None] * v
+    o = o.permute(1, 0, 2)
     return o
 
 
@@ -84,7 +88,6 @@ def flash_fwdbwd(rope, position_ids, do, q, k, v, lengths):
         max_seqlen_k=max_len,
         causal=True
     )
-    o = o.permute(1, 0, 2)
     return o
 
 
@@ -121,7 +124,7 @@ def benchmark_varlen(batch_size, num_heads, head_dim, length, dtype, provider, b
     q.requires_grad_()
     k.requires_grad_()
     v.requires_grad_()
-    do = torch.randn((num_heads, total_length, head_dim), device=device, dtype=dtype)
+    do = torch.randn((total_length, num_heads, head_dim), device=device, dtype=dtype)
     position_ids = torch.arange(q.size(1), device=device, dtype=torch.int32)[None, :]
 
     if provider== "reference":

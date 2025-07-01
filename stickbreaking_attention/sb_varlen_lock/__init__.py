@@ -54,8 +54,11 @@ class StickBreakingAttention(torch.autograd.Function):
             max_seqlens = ctx.max_seqlens
             attend_current = ctx.attend_current
             q, k, v, neg_log_acc, cu_seqlens = ctx.saved_tensors
-            do = do.contiguous()
-            drem = drem.contiguous()
+            # q = q.contiguous()
+            # k = k.contiguous()
+            # v = v.contiguous()
+            # do = do.contiguous()
+            # drem = drem.contiguous()
             dq, dk, dv = varlen_bwd(
                 do, drem,
                 q, k, v,
@@ -76,7 +79,7 @@ class StickBreakingAttention(torch.autograd.Function):
             #         continue
             #     else:
             #         break
-
+            assert not (torch.isnan(dq).any() or torch.isnan(dk).any() or torch.isnan(dv).any())
             # if (torch.isnan(dq).any() or
             #     torch.isnan(dk).any() or
             #     torch.isnan(dv).any()):

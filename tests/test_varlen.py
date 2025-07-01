@@ -30,14 +30,19 @@ def ref_bwd(do, q, k, v, lengths, attend_current=False):
     q.requires_grad = True
     k.requires_grad = True
     v.requires_grad = True
-    output = ref_fwd(q, k, v, lengths, attend_current=attend_current)
-    output.backward(do)
+    q_ = q.permute(1, 0, 2)
+    k_ = k.permute(1, 0, 2)
+    v_ = v.permute(1, 0, 2)
+    output = ref_fwd(q_, k_, v_, lengths, attend_current=attend_current)
+    do_ = do.permute(1, 0, 2)
+    output.backward(do_)
     dq = q.grad
     dk = k.grad
     dv = v.grad
     q.grad = None
     k.grad = None
     v.grad = None
+    output = output.permute(1, 0, 2)
     return output, dq, dk, dv
 
 def assert_close(varname, a, b, eps):
@@ -82,9 +87,9 @@ class TestClass:
         lengths = torch.randint(length, length + 1, (batch_size,)).to(device=device, dtype=torch.int32)
         total_length = lengths.sum()
         cu_seqlens = torch.cumsum(lengths, dim=-1)
-        q = 0.25 * (torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) + 1)
-        k = 0.25 * (torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) - 1) 
-        v = 0.25 * torch.randn((num_heads, total_length, head_dim), device=device, dtype=torch.float32) 
+        q = 0.25 * (torch.randn((total_length, num_heads, head_dim), device=device, dtype=torch.float32) + 1)
+        k = 0.25 * (torch.randn((total_length, num_heads, head_dim), device=device, dtype=torch.float32) - 1) 
+        v = 0.25 * torch.randn((total_length, num_heads,  head_dim), device=device, dtype=torch.float32) 
         print(q.max(), k.max(), v.max())
 
         q = q.to(dtype)
@@ -93,15 +98,23 @@ class TestClass:
         q.requires_grad_()
         k.requires_grad_()
         v.requires_grad_()
-        do = torch.randn((num_heads, total_length, head_dim), device=device, dtype=dtype) # * 0. \
+        do = torch.randn((total_length, num_heads, head_dim), device=device, dtype=dtype) # * 0. \
         #     + 0.001 * torch.arange(total_length, device=device, dtype=torch.float32)[None, :, None]
         with torch.cuda.device(device):
-            o, rem = sb_attn_varlen(q, k, v,
-                                    cu_seqlens=cu_seqlens,
-                                    max_seqlens=torch.max(lengths).item(),
-                                    inv_temp=1 / math.sqrt(q.size(-1)),
-                                    zero_start=False,
-                                    attend_current=attend_current)
+            q_ = q.permute(1, 0, 2)
+            k_ = k.permute(1, 0, 2)
+            v_ = v.permute(1, 0, 2)
+            o_, rem = sb_attn_varlen(
+                q_,
+                k_,
+                v_,
+                cu_seqlens=cu_seqlens,
+                max_seqlens=torch.max(lengths).item(),
+                inv_temp=1 / math.sqrt(q.size(-1)),
+                zero_start=False,
+                attend_current=attend_current
+            )
+            o = o_.permute(1, 0, 2)
             # o = o + rem[..., None] * v
             ref_out, ref_dq, ref_dk, ref_dv = ref_bwd(do, q, k, v, lengths, attend_current=attend_current)
         eps = 0.05
