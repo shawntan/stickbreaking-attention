@@ -72,7 +72,7 @@ class TestClass:
     @pytest.mark.parametrize('batch_size', [4, 2, 1])
     @pytest.mark.parametrize('num_heads', [12, 24, 8, 4, 2, 1, 7])
     @pytest.mark.parametrize('head_dim', [128, 64, 32, 16, 50])
-    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 256, 128, 64, 500])
+    @pytest.mark.parametrize('length', [4096, 2048, 1024, 512, 256, 128, 64, 500, 60])
     # @pytest.mark.parametrize('batch_size', [1])
     # @pytest.mark.parametrize('num_heads', [12, 3])
     # @pytest.mark.parametrize('head_dim', [128])

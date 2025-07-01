@@ -150,6 +150,8 @@ def _backward(
                 backward=True,
                 is_compiling=False,
             )
+
+            neg_log_acc = tl.where(M_mask, neg_log_acc, 0.0)
             # tl.store(Att_ptr + atth_stride * head_id +  attm_stride * M_blk_idxs[:, None] + N_blk_idxs[None, :], p)
 
             # block_dv = tl.dot(tl.trans(p), do.to(p.dtype), allow_tf32=ALLOW_TF32)
